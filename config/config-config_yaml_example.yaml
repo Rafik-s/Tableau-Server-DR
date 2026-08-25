@@ -1,0 +1,28 @@
+tableau_dr:
+  environment:
+    version: "2025.3"
+    active_directory:
+      domain: "tableau.example.com"
+      run_as_user: "tableaurun"
+
+  azure:
+    key_vault_name: "kv-tableau-dr-prod"
+    storage_account_name: "sttableaudrprod"
+    storage_container: "tableau-dr-backups"
+
+  servers:
+    primary:
+      hostname: "prod-tab-01.tableau.example.com"
+      tsm_port: 8850
+    disaster_recovery:
+      hostname: "dr-tab-01.tableau.example.com"
+      tsm_port: 8850
+
+  security:
+    ssl:
+      cert_file_path: "C:/TableauCerts/server.crt"
+      key_file_path: "C:/TableauCerts/server.key"
+    saml:
+      entity_id: "https://tableau.example.com"
+      return_url: "https://tableau.example.com"
+      metadata_file: "C:/TableauCerts/saml_metadata.xml"

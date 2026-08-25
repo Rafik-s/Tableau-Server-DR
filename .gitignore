@@ -1,0 +1,15 @@
+# Python environment
+__pycache__/
+*.py[cod]
+*.venv/
+venv/
+
+# Local DR artifacts and keys
+config/config.yaml
+*.tsbak
+*.json
+*.crt
+*.key
+*.xml
+Exports/
+Downloads/
