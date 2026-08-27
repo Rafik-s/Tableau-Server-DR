@@ -10,7 +10,7 @@ from tableau_dr.logger import get_logger
 from tableau_dr.backup_manager import BackupManager
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tableau Server Enterprise DR Backup Driver")
     parser.add_argument(
         "--config",
@@ -20,7 +20,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
     run_id = uuid.uuid4().hex[:8].upper()
     logger = get_logger("TableauDR-Backup", run_id=run_id)
@@ -32,21 +32,21 @@ def main():
 
         if result.status != "SUCCESS":
         logger.error("Backup pipeline returned a non-success status.")
-        sys.exit(1)
+        return 1
 
         if not result.remote_verified:
         logger.error("Backup completed but remote verification did not pass.")
-        sys.exit(1)
-        
+        return 1
+
         if result.cleanup_status == "FAILED":
             logger.warning("Backup complete and verified remotely, but local staging cleanup failed.")
-            sys.exit(0)
+            return 0
 
         logger.info("DR Backup Pipeline Completed Successfully.")
-        sys.exit(0)
+        return 0
     except Exception as e:
         logger.critical(f"FATAL: Backup Execution Failed: {e}")
-        sys.exit(1)
+        raise SystemExit(main())
 
 
 if __name__ == "__main__":
