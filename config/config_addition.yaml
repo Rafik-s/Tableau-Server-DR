@@ -1,0 +1,12 @@
+# config/config.yaml additions
+azure:
+  key_vault_name: "kv-tableau-dr-prod"
+  storage_account_name: "sttableaudrprod"
+  storage_container: "tableau-dr-backups"
+  max_retries: 4
+  retry_backoff_factor: 2.0
+
+backup:
+  minimum_free_space_gb: 50
+  minimum_backup_size_mb: 10
+  verify_remote_content_sha256: false

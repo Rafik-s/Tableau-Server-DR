@@ -1,0 +1,45 @@
+FAILOVER ORCHESTRATION PIPELINE
+                                              │
+                                              ▼
+                                   1. Disaster Declaration
+                                 (Manual or Operator CLI)
+                                              │
+                                              ▼
+                                    2. Fencing Validation
+                               (Verify Prod is Isolated/Down)
+                                              │
+                                              ▼
+                                    3. Pre-Restore Checks
+                             (DR Disk Space, Version & Store)
+                                              │
+                                              ▼
+                                 4. Download Remote Manifest
+                                (Verify Remote Blob Checksums)
+                                              │
+                                              ▼
+                                  5. Stop DR Tableau Server
+                                 (tsm stop --ignore-prompt)
+                                              │
+                                              ▼
+                                  6. Restore Repository Data
+                                 (tsm maintenance restore)
+                                              │
+                                              ▼
+                                 7. Import Configurations
+                                   (tsm settings import)
+                                              │
+                                              ▼
+                                   8. SSL & SAML Re-binding
+                              (Re-apply DR endpoints & certs)
+                                              │
+                                              ▼
+                                   9. Start Tableau Server
+                                        (tsm start)
+                                              │
+                                              ▼
+                                  10. System Health Checks
+                                (TSM Status, HTTP Ping, Gateway)
+                                              │
+                                              ▼
+                                  11. RPO/RTO Tracking Report
+                               (Calculate Recovery Gap vs Limits)

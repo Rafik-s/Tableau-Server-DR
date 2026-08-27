@@ -1,0 +1,30 @@
+1. Pre-flight Checks
+             (Disk Space, TSM Status)
+                        │
+                        ▼
+               2. TSM Settings Export
+             (topology & config export)
+                        │
+                        ▼
+               3. TSM Backup Creation
+             (Data & File Store .tsbak)
+                        │
+                        ▼
+          4. Integrity Check & SHA-256
+             (Chunked hashing of artifacts)
+                        │
+                        ▼
+           5. Generate JSON Manifest
+          (Version, Hashing, RPO Metadata)
+                        │
+                        ▼
+           6. Azure Blob SDK Upload
+         (Upload .tsbak, .json, settings)
+                        │
+                        ▼
+           7. Upload Integrity Check
+           (Verify Azure Blob size/hash)
+                        │
+                        ▼
+           8. Local Retention Cleanup
+       (Only executes after successful upload)
