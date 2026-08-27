@@ -1,15 +1,13 @@
-# Python environment
-__pycache__/
-*.py[cod]
-*.venv/
-venv/
-
-# Local DR artifacts and keys
-config/config.yaml
+# Staging and Backups
 *.tsbak
 *.json
-*.crt
-*.key
-*.xml
-Exports/
-Downloads/
+!config/config.yaml.example
+
+# Python & Environment
+__pycache__/
+*.pyc
+.env
+venv/
+
+# Logs
+*.log
