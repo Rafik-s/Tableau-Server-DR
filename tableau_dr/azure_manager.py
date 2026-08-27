@@ -1,4 +1,4 @@
-"""Native Azure Blob Storage Manager with bounded retries and SHA-256 metadata verification."""
+"""Azure Blob Storage integration using DefaultAzureCredential and explicit retry backoff."""
 
 from __future__ import annotations
 
@@ -12,13 +12,12 @@ from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
 from tableau_dr.exceptions import SecurityValidationError, ValidationError
-from tableau_dr.security import sha256_file
 
 logger = logging.getLogger(__name__)
 
 
 class AzureManager:
-    """Manages secure blob uploads and remote verification via Managed Identity / DefaultAzureCredential."""
+    """Manages cloud backup persistence with SHA-256 integrity verification."""
 
     def __init__(
         self,
@@ -34,7 +33,7 @@ class AzureManager:
         try:
             self.credential = DefaultAzureCredential()
             retry_policy = ExponentialRetry(
-                initial_backoff=2,
+                initial_backoff=int(backoff_factor * 2),
                 max_attempts=max_retries,
                 random_jitter_range=1,
             )
@@ -48,16 +47,10 @@ class AzureManager:
             logger.error(f"Failed to initialize Azure Blob Client: {e}")
             raise ValidationError(f"Azure authentication initialization failed: {e}") from e
 
-    def upload_file(
-        self,
-        local_path: str | Path,
-        blob_path: str,
-        sha256_checksum: str,
-    ) -> str:
-        """Uploads a local file to Azure Blob Storage, attaching SHA-256 digest as custom blob metadata."""
+    def upload_file(self, local_path: str | Path, blob_path: str, sha256_checksum: str) -> str:
         file_path = Path(local_path)
         if not file_path.exists():
-            raise FileNotFoundError(f"Cannot upload non-existent local file: {file_path}")
+            raise FileNotFoundError(f"Local file does not exist: {file_path}")
 
         blob_client = self.container_client.get_blob_client(blob_path)
         metadata = {"sha256": sha256_checksum.lower()}
@@ -78,29 +71,21 @@ class AzureManager:
         expected_sha256: str,
         verify_content_stream: bool = False,
     ) -> bool:
-        """
-        Verifies uploaded blob properties:
-        1. Remote size_bytes vs local size.
-        2. Remote metadata sha256 vs local SHA-256.
-        3. Optional stream re-hashing for absolute cryptographic content assurance.
-        """
         try:
             blob_client = self.container_client.get_blob_client(blob_path)
             properties = blob_client.get_blob_properties()
 
-            # 1. Size Verification
             if properties.size != expected_size_bytes:
                 raise SecurityValidationError(
                     f"Remote blob size mismatch for '{blob_path}'. "
                     f"Expected: {expected_size_bytes} | Actual: {properties.size}"
                 )
 
-            # 2. SHA-256 Metadata Verification
             remote_metadata = properties.metadata or {}
             remote_sha256 = remote_metadata.get("sha256", "").lower()
 
             if not remote_sha256:
-                raise SecurityValidationError(f"Remote blob '{blob_path}' is missing SHA-256 metadata!")
+                raise SecurityValidationError(f"Remote blob '{blob_path}' is missing SHA-256 metadata.")
 
             if not hmac.compare_digest(remote_sha256, expected_sha256.lower()):
                 raise SecurityValidationError(
@@ -108,9 +93,8 @@ class AzureManager:
                     f"Expected: {expected_sha256.lower()} | Actual: {remote_sha256}"
                 )
 
-            # 3. Optional Stream Content Re-hashing
             if verify_content_stream:
-                logger.info(f"Executing full stream verification for '{blob_path}'...")
+                logger.info(f"Executing full stream checksum validation for '{blob_path}'...")
                 download_stream = blob_client.download_blob()
                 import hashlib
                 digest = hashlib.sha256()
@@ -123,7 +107,7 @@ class AzureManager:
                         f"Stream content SHA-256 re-hash mismatch for '{blob_path}'!"
                     )
 
-            logger.info(f"[PASS] Remote Blob Verification Success: '{blob_path}'")
+            logger.info(f"[PASS] Remote Blob Verified: '{blob_path}'")
             return True
 
         except AzureError as e:

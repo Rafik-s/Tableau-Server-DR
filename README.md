@@ -1,47 +1,165 @@
 # Tableau-Server-DR
 # Tableau Server Modern TSM Disaster Recovery (Azure)
 
-tableau-server-tsm-dr/
+Tableau-Server-DR/
+│
+├── tableau_dr/
+│   ├── __init__.py
+│   │
+│   ├── config.py
+│   ├── exceptions.py
+│   ├── logger.py
+│   │
+│   ├── tab_server_connector.py
+│   ├── security.py
+│   ├── validation.py
+│   │
+│   ├── azure_manager.py
+│   ├── backup_manager.py
+│   │
+│   ├── fencing.py
+│   ├── recovery_manager.py
+│   ├── health_check.py
+│   └── dr_orchestrator.py
+│
+├── execute_backup.py
+├── execute_switchover.py
 │
 ├── config/
-│   └── config.yaml.example          # Sample configuration file
+│   └── config.yaml.example
 │
-     ├── tableau_dr/
-        │
-        ├── __init__.py
-        ├── exceptions.py
-        ├── config.py
-        ├── logger.py
-        ├── security.py
-        ├── validation.py
-        ├── tab_server_connector.py
-        ├── azure_manager.py
-        ├── backup_manager.py
-        └── execute_backup.py
+├── tests/
+│   ├── test_config.py
+│   ├── test_security.py
+│   ├── test_tsm_connector.py
+│   ├── test_azure_manager.py
+│   ├── test_backup_manager.py
+│   ├── test_fencing.py
+│   ├── test_recovery_manager.py
+│   └── test_health_check.py
 │
-├── .gitignore
-├── defaults.py                      # Default configuration constants and file paths
-├── execute_switchover.py            # Main entry point for DR failover / switchover execution
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+│
+├── requirements.txt
 ├── README.md
-├── 
-├── requirements.txt                 # Python dependencies
-├── 
-└── validate_prepare_env.ps1         # PowerShell script to validate WinRM, Azure CLI, and TSM permissions
+├── SECURITY.md
+├── LICENSE
+└── .gitignore
+
+
+Target Archiechuture
+
+                    ┌──────────────────────┐
+                    │ execute_backup.py    │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │ BackupManager        │
+                    └──────────┬───────────┘
+                               │
+                ┌──────────────┼──────────────┐
+                ▼              ▼              ▼
+          Preflight          TSM           Security
+                │              │              │
+                └──────────────┼──────────────┘
+                               ▼
+                        Local Artifacts
+                               │
+                               ▼
+                         SHA-256 Hash
+                               │
+                               ▼
+                           Manifest
+                               │
+                               ▼
+                       Azure Blob SDK
+                               │
+                               ▼
+                       Remote Verification
+                               │
+                    ┌──────────┴──────────┐
+                    │                     │
+                  PASS                  FAIL
+                    │                     │
+                    ▼                     ▼
+             Local Cleanup          Preserve Files
 
 
 
-Automated backup, replication, and disaster recovery framework designed for **Tableau Server 2020.1+ through 2025.x** running on Windows Server with Azure Cloud infrastructure.
+                  execute_switchover.py
+                           │
+                           ▼
+                     DR Orchestrator
+                           │
+              ┌────────────┴────────────┐
+              ▼                         ▼
+         Fencing Gate             Operator Approval
+              │
+              ▼
+       Manifest Verification
+              │
+              ▼
+       Artifact Verification
+              │
+              ▼
+          DR Stop
+              │
+              ▼
+          Restore
+              │
+              ▼
+       Settings Import
+              │
+              ▼
+      SSL/SAML Rebinding
+              │
+              ▼
+           Start
+              │
+              ▼
+        Health Checks
+              │
+              ▼
+          RPO/RTO
+              │
+              ▼
+       RecoveryResult
 
-## Features
-* TSM native automation (`tsm maintenance backup`, `tsm settings export`)
-* Direct integration with Azure Blob Storage via `AzCopy` and Managed Identities
-* Retains SSL and SAML authentication settings for DR failover
-* No direct Postgres streaming required; fully compliant with modern Tableau architecture
 
-## Quickstart
-1. Install dependencies: `pip install -r requirements.txt`
-2. Run validation script: `.\validate_prepare_env.ps1`
-3. Copy `config/config.yaml.example` to `config/config.yaml` and update settings.
-4. Execute scheduled backup: `python tableau_dr.py`
-5. Execute failover on DR node: `python execute_switchover.py <backup_filename.tsbak>`
+
+# Enterprise Tableau Server Disaster Recovery Framework
+
+An enterprise-grade, automated Disaster Recovery (DR) and business continuity framework for Tableau Server deployments. Built for high availability, zero data loss (low RPO/RTO), and strict split-brain prevention using Azure Cloud infrastructure and TSM CLI automation.
+
+## Key Architectural Features
+
+* **State-Machine Recovery Engine:** Strict 10-stage sequential failover workflow with isolated state transitions.
+* **Production Fencer:** Prevents active-active/split-brain states by validating network and HTTP isolation before initiating DR restore.
+* **Cryptographic Integrity Verification:** Standardized SHA-256 digest validation for backups, settings, and manifests via Azure Storage Blob metadata and stream re-hashing.
+* **Non-Interactive Execution:** Process-isolated TSM executions detaching `stdin` to prevent hung automation pipelines.
+* **Multi-Layer Health Engine:** Post-restoration health verification across TSM processes, SSL gateways, Vizportal APIs, and Tableau licensing states.
+* **RPO/RTO Audit Metrics:** Automatic calculation and reporting of recovery point age and overall time to restore.
+
+---
+
+## Directory Layout
+
+```text
+Tableau-Server-DR/
+├── tableau_dr/             # Core Python framework package
+│   ├── config.py           # Strict YAML schema validation
+│   ├── tab_server_connector.py # Safe TSM CLI subprocess wrapper
+│   ├── backup_manager.py   # Isolated backup pipeline & manifest generation
+│   ├── fencing.py          # Production network isolation validator
+│   ├── recovery_manager.py # State-machine driven failover engine
+│   ├── health_check.py     # Post-restore verification engine
+│   └── azure_manager.py    # Azure SDK Blob Storage driver
+├── execute_backup.py       # Production CLI backup driver
+├── execute_switchover.py   # Disaster recovery failover CLI driver
+├── config/                 # Configuration templates
+├── tests/                  # Pytest automated testing suite
+└── .github/workflows/      # CI/CD pipelines
 

@@ -1,4 +1,4 @@
-"""Backup Orchestration Manager with robust error boundary logging and BackupResult DTO."""
+"""Orchestrates isolated DR backup execution and remote persistence."""
 
 from __future__ import annotations
 
@@ -23,27 +23,26 @@ logger = logging.getLogger(__name__)
 @dataclass
 class BackupResult:
     run_id: str
-    status: str  # SUCCESS, FAILED
+    status: str
     started_at_utc: str
     completed_at_utc: str
     duration_seconds: float
     manifest_path: str
     artifacts: dict
     remote_verified: bool
-    cleanup_status: str  # SUCCESS, FAILED, SKIPPED
+    cleanup_status: str
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 class BackupManager:
-    """Orchestrates end-to-end Tableau backup execution and structured result generation."""
+    """Executes backup pipelines, manifest serialization, and cleanup."""
 
     def __init__(self, config: Config, run_id: str):
         self.config = config
         self.run_id = run_id
         
-        # Configure TSM with explicit path resolution
         yaml_executable = config.tsm.get("executable") if config.tsm else None
         self.tsm = TSMConnector(yaml_executable=yaml_executable)
         
@@ -51,6 +50,8 @@ class BackupManager:
         self.azure = AzureManager(
             account_name=azure_cfg["storage_account_name"],
             container_name=azure_cfg["storage_container"],
+            max_retries=azure_cfg.get("max_retries", 3),
+            backoff_factor=azure_cfg.get("retry_backoff_factor", 0.8),
         )
         
         self.started_at_dt = datetime.datetime.now(datetime.timezone.utc)
@@ -61,14 +62,10 @@ class BackupManager:
         self.run_work_dir = base_backup_dir / self.run_dir_name
 
     def execute_backup_pipeline(self) -> BackupResult:
-        """Executes the complete fail-closed backup workflow."""
         start_time = time.time()
         logger.info(f"Starting DR Backup Pipeline [RUN_ID={self.run_id}]...")
 
-        # 1. Pre-flight Validation
         self._run_preflight()
-
-        # Create isolated workspace directory
         self.run_work_dir.mkdir(parents=True, exist_ok=True)
 
         local_artifacts = {}
@@ -77,7 +74,7 @@ class BackupManager:
         remote_verified = False
 
         try:
-            # 2. Export TSM Settings
+            # 1. Export Settings
             settings_filename = f"tableau_settings_{self.timestamp_str}.json"
             settings_path = self.run_work_dir / settings_filename
             self.tsm.export_settings(str(settings_path))
@@ -92,12 +89,11 @@ class BackupManager:
                 "blob_path": f"{remote_blob_folder}/{settings_filename}",
             }
 
-            # 3. Create TSM Repository Backup (.tsbak) using explicit pathing
+            # 2. Repository Backup (.tsbak) via explicit path
             tsbak_filename = f"tableau_backup_{self.timestamp_str}.tsbak"
             tsbak_target_path = self.run_work_dir / tsbak_filename
-            
-            # Pass explicit path (without .tsbak extension as expected by TSM CLI)
             tsbak_arg_path = str(self.run_work_dir / f"tableau_backup_{self.timestamp_str}")
+            
             self.tsm.create_backup(tsbak_arg_path, append_date=False)
 
             min_backup_mb = self.config.backup.get("minimum_backup_size_mb", 10)
@@ -112,7 +108,7 @@ class BackupManager:
                 "blob_path": f"{remote_blob_folder}/{tsbak_filename}",
             }
 
-            # 4. Build Clean Manifest (Resolves Circular Dependency)
+            # 3. Serialize Non-Circular Manifest
             duration_so_far = round(time.time() - start_time, 2)
             manifest_data = {
                 "manifest_version": "2.0",
@@ -145,39 +141,41 @@ class BackupManager:
             manifest_sha256 = sha256_file(manifest_path)
             manifest_blob_path = f"{remote_blob_folder}/{manifest_filename}"
 
-            # 5. Azure Upload Sequence
+            # 4. Azure Upload Sequence
             logger.info("Uploading source artifacts and manifest to Azure Blob Storage...")
-            for artifact_key, meta in local_artifacts.items():
+            for meta in local_artifacts.values():
                 self.azure.upload_file(
                     local_path=meta["local_path"],
                     blob_path=meta["blob_path"],
                     sha256_checksum=meta["sha256"],
                 )
             
-            # Upload manifest
             self.azure.upload_file(
                 local_path=str(manifest_path),
                 blob_path=manifest_blob_path,
                 sha256_checksum=manifest_sha256,
             )
 
-            # 6. Remote Integrity Verification
+            # 5. Remote Integrity Verification
             logger.info("Verifying remote Azure Blob Storage integrity...")
-            for artifact_key, meta in local_artifacts.items():
+            verify_stream = self.config.backup.get("verify_remote_content_sha256", False)
+            for meta in local_artifacts.values():
                 self.azure.verify_remote_blob(
                     blob_path=meta["blob_path"],
                     expected_size_bytes=meta["size_bytes"],
                     expected_sha256=meta["sha256"],
+                    verify_content_stream=verify_stream,
                 )
             
             self.azure.verify_remote_blob(
                 blob_path=manifest_blob_path,
                 expected_size_bytes=manifest_path.stat().st_size,
                 expected_sha256=manifest_sha256,
+                verify_content_stream=verify_stream,
             )
             remote_verified = True
 
-            # 7. Fail-Closed Local Cleanup
+            # 6. Fail-Closed Cleanup
             cleanup_status = self._execute_local_cleanup()
 
             completed_at_dt = datetime.datetime.now(datetime.timezone.utc)
@@ -196,26 +194,23 @@ class BackupManager:
             )
 
         except Exception as e:
-            logger.error(f"BACKUP PIPELINE FAILED: {e}. Preserving local workspace.")
-            raise TableauDRError(f"Backup pipeline execution failure: {e}") from e
+            logger.error(f"BACKUP PIPELINE FAILED: {e}. Preserving staging directory for diagnosis.")
+            raise TableauDRError(f"Backup execution failure: {e}") from e
 
     def _run_preflight(self) -> None:
-        """Runs pre-flight disk capacity and TSM checks."""
-        logger.info("Running pre-flight system checks...")
         min_free_gb = float(self.config.backup.get("minimum_free_space_gb", 50.0))
         validate_disk_space(self.config.paths["backup_dir"], required_gb=min_free_gb)
         
         status_res = self.tsm.status()
         if not status_res.success:
-            raise ValidationError(f"TSM cluster check failed prior to backup: {status_res.stderr}")
+            raise ValidationError(f"TSM check failed prior to backup: {status_res.stderr}")
 
     def _execute_local_cleanup(self) -> str:
-        """Deletes local working directory after verified upload."""
         logger.info("Cleaning up local staging directory...")
         try:
             shutil.rmtree(self.run_work_dir)
             logger.info("[PASS] Local cleanup complete.")
             return "SUCCESS"
         except Exception as e:
-            logger.warning(f"Cleanup non-fatal error: Failed to remove working directory: {e}")
+            logger.warning(f"Cleanup non-fatal error: Could not remove directory: {e}")
             return "FAILED"

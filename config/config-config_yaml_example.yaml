@@ -1,28 +1,32 @@
-tableau_dr:
-  environment:
-    version: "2025.3"
-    active_directory:
-      domain: "tableau.example.com"
-      run_as_user: "tableaurun"
+environment:
+  version: "2025.1.0"
 
-  azure:
-    key_vault_name: "kv-tableau-dr-prod"
-    storage_account_name: "sttableaudrprod"
-    storage_container: "tableau-dr-backups"
+azure:
+  key_vault_name: "kv-tableau-dr-prod"
+  storage_account_name: "sttableaudrprod"
+  storage_container: "tableau-dr-backups"
+  max_retries: 3
+  retry_backoff_factor: 0.8
 
-  servers:
-    primary:
-      hostname: "prod-tab-01.tableau.example.com"
-      tsm_port: 8850
-    disaster_recovery:
-      hostname: "dr-tab-01.tableau.example.com"
-      tsm_port: 8850
+servers:
+  production:
+    hostname: "tableau-prod.internal.net"
+    identity_store: "activedirectory"
+  disaster_recovery:
+    hostname: "tableau-dr.internal.net"
+    identity_store: "activedirectory"
 
-  security:
-    ssl:
-      cert_file_path: "C:/TableauCerts/server.crt"
-      key_file_path: "C:/TableauCerts/server.key"
-    saml:
-      entity_id: "https://tableau.example.com"
-      return_url: "https://tableau.example.com"
-      metadata_file: "C:/TableauCerts/saml_metadata.xml"
+paths:
+  backup_dir: "C:\\tableau_dr_staging\\backups"
+  recovery_work_dir: "C:\\tableau_dr_staging\\recovery"
+
+backup:
+  minimum_free_space_gb: 50.0
+  minimum_backup_size_mb: 10.0
+  verify_remote_content_sha256: false
+
+tsm:
+  executable: "C:\\Program Files\\Tableau\\Tableau Server\\packages\\bin.20251.0.0\\tsm.cmd"
+
+security:
+  emergency_fencing_auth_code: "CHANGE_ME_IN_SECURE_VAULT"

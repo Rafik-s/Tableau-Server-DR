@@ -1,5 +1,4 @@
-pyyaml>=6.0.1
-azure-identity>=1.15.0
 azure-storage-blob>=12.19.0
+azure-identity>=1.15.0
 azure-keyvault-secrets>=4.8.0
-click>=8.1.7
+pyyaml>=6.0.1

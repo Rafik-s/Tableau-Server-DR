@@ -1,4 +1,4 @@
-"""State Machine Driven Failover and Recovery Orchestrator."""
+"""State-Machine DR Recovery Orchestrator with fixed state-assignment sequence."""
 
 from __future__ import annotations
 
@@ -89,6 +89,8 @@ class RecoveryManager:
         self.azure = AzureManager(
             account_name=azure_cfg["storage_account_name"],
             container_name=azure_cfg["storage_container"],
+            max_retries=azure_cfg.get("max_retries", 3),
+            backoff_factor=azure_cfg.get("retry_backoff_factor", 0.8),
         )
         
         self.fencer = ProductionFencer(config)
@@ -96,32 +98,33 @@ class RecoveryManager:
         self.current_state = RecoveryState.DISASTER_DECLARED
         self.stage_timings: Dict[str, StageTiming] = {}
         
-        base_recovery_dir = Path(config.paths.get("recovery_work_dir", "C:\\tableau_dr_staging\\recovery"))
+        base_recovery_dir = Path(config.paths["recovery_work_dir"])
         self.work_dir = base_recovery_dir / f"recovery_{self.run_id}"
 
-    def _execute_stage(self, state: RecoveryState, func, *args, **kwargs):
-        """Executes a single recovery state stage with timing and state transition guarantees."""
-        logger.info(f"=== STATE TRANSITION: Entering {state.value} ===")
+    def _execute_stage(self, target_state: RecoveryState, func, *args, **kwargs):
+        """Executes a recovery stage with pre-execution state setting for precise error isolation."""
+        logger.info(f"=== STATE TRANSITION: Entering {target_state.value} ===")
         t_start = time.time()
         start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        
+        # State updated before function call to isolate failure stage accurately
+        self.current_state = target_state
         
         try:
             result = func(*args, **kwargs)
             t_end = time.time()
             end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             
-            self.stage_timings[state.value] = StageTiming(
+            self.stage_timings[target_state.value] = StageTiming(
                 started_at=start_iso,
                 completed_at=end_iso,
                 duration_seconds=round(t_end - t_start, 2),
             )
-            self.completed_steps.append(state)
-            self.current_state = state
+            self.completed_steps.append(target_state)
             return result
         except Exception as e:
-            self.current_state = RecoveryState.FAILED
-            logger.critical(f"STATE EXECUTION FAILED at [{state.value}]: {e}")
-            raise RecoveryError(f"Recovery failed at state {state.value}: {e}") from e
+            logger.critical(f"STATE EXECUTION FAILED at [{target_state.value}]: {e}")
+            raise RecoveryError(f"Recovery failed at state {target_state.value}: {e}") from e
 
     def execute_failover(
         self,
@@ -129,7 +132,6 @@ class RecoveryManager:
         operator_reason: Optional[str] = None,
         target_manifest_blob: Optional[str] = None,
     ) -> RecoveryResult:
-        """Executes full DR restoration workflow."""
         disaster_declared_dt = datetime.datetime.now(datetime.timezone.utc)
         self.completed_steps.append(RecoveryState.DISASTER_DECLARED)
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -140,17 +142,16 @@ class RecoveryManager:
         failed_stage: Optional[RecoveryState] = None
 
         try:
-            # 1. Fencing Validation
+            # 1. Production Fencing
             def _fencing_step():
                 nonlocal fencing_res
-                self.current_state = RecoveryState.FENCING_PENDING
                 fencing_res = self.fencer.evaluate_fencing(
                     emergency_authorization_code=emergency_auth_code,
                     operator_reason=operator_reason,
                 )
                 if not fencing_res.is_fenced:
                     raise SecurityValidationError(f"Fencing Check Failed: {fencing_res.details}")
-            
+
             self._execute_stage(RecoveryState.PRODUCTION_FENCED, _fencing_step)
 
             # 2. DR Pre-flight
@@ -158,10 +159,10 @@ class RecoveryManager:
                 res = self.tsm.status()
                 if not res.success:
                     raise ValidationError(f"Target DR TSM cluster is unresponsive: {res.stderr}")
-            
+
             self._execute_stage(RecoveryState.DR_PREFLIGHT_PASSED, _preflight_step)
 
-            # 3. Acquire and Validate Manifest
+            # 3. Acquire Manifest
             manifest_data: dict = {}
             local_manifest_path = self.work_dir / "manifest.json"
 
@@ -169,11 +170,10 @@ class RecoveryManager:
                 nonlocal manifest_data, backup_created_at_dt
                 blob_name = target_manifest_blob
                 if not blob_name:
-                    # Resolve latest manifest blob from Azure
                     blobs = list(self.azure.container_client.list_blobs(name_starts_with="backups/"))
                     manifest_blobs = sorted([b.name for b in blobs if b.name.endswith(".json") and "manifest" in b.name])
                     if not manifest_blobs:
-                        raise ValidationError("No manifest JSON files found in remote storage!")
+                        raise ValidationError("No manifest JSON files found in remote storage.")
                     blob_name = manifest_blobs[-1]
 
                 blob_client = self.azure.container_client.get_blob_client(blob_name)
@@ -183,20 +183,21 @@ class RecoveryManager:
                 with open(local_manifest_path, "r", encoding="utf-8") as f:
                     manifest_data = json.load(f)
 
-                # Validate Source Version Match
                 source_ver = manifest_data.get("source", {}).get("tableau_version")
                 dr_ver = self.config.environment["version"]
                 if source_ver != dr_ver:
                     raise ValidationError(
-                        f"Version Mismatch! Source Manifest: {source_ver} | DR Cluster Config: {dr_ver}"
+                        f"Version Mismatch! Manifest Version: {source_ver} | DR Target Version: {dr_ver}"
                     )
 
                 started_str = manifest_data["timing"]["started_at_utc"]
-                backup_created_at_dt = datetime.datetime.fromisoformat(started_str)
+                # Normalize ISO string 'Z' suffix for Python parsing compatibility
+                normalized_iso = started_str.replace("Z", "+00:00")
+                backup_created_at_dt = datetime.datetime.fromisoformat(normalized_iso)
 
             self._execute_stage(RecoveryState.MANIFEST_VALIDATED, _manifest_step)
 
-            # 4. Download and Validate Artifacts
+            # 4. Download & Validate Artifacts
             local_artifacts: Dict[str, Path] = {}
 
             def _artifacts_step():
@@ -230,10 +231,9 @@ class RecoveryManager:
 
             self._execute_stage(RecoveryState.DR_STOPPED, _stop_step)
 
-            # 6. Restore Repository
+            # 6. Restore Repository Data
             def _restore_step():
                 tsbak_path = str(local_artifacts["backup.tsbak"])
-                # Executing TSM restore with explicit tsbak path
                 self.tsm.run(["maintenance", "restore", "--file", tsbak_path], timeout=14400)
 
             self._execute_stage(RecoveryState.REPOSITORY_RESTORED, _restore_step)
@@ -245,7 +245,7 @@ class RecoveryManager:
 
             self._execute_stage(RecoveryState.SETTINGS_IMPORTED, _settings_step)
 
-            # 8. Rebind Security Credentials securely from Key Vault
+            # 8. Security Credential Rebinding
             def _security_step():
                 self._apply_key_vault_security_bindings()
 
@@ -257,7 +257,7 @@ class RecoveryManager:
 
             self._execute_stage(RecoveryState.DR_STARTED, _start_step)
 
-            # 10. Run Health Smoke Checks
+            # 10. Post-Restore Health Checks
             def _health_step():
                 nonlocal health_res
                 checker = HealthChecker(
@@ -270,24 +270,22 @@ class RecoveryManager:
 
             self._execute_stage(RecoveryState.HEALTH_VALIDATED, _health_step)
 
-            # Finalize Recovery State
-            self.current_state = RecoveryState.RECOVERY_COMPLETED
             self.completed_steps.append(RecoveryState.RECOVERY_COMPLETED)
+            final_state = RecoveryState.RECOVERY_COMPLETED
 
         except Exception as e:
             failed_stage = self.current_state
-            logger.critical(f"DR Failover Orchestration ABORTED: {e}")
+            final_state = RecoveryState.FAILED
+            logger.critical(f"DR Failover Execution ABORTED: {e}")
 
         completed_dt = datetime.datetime.now(datetime.timezone.utc)
-        
-        # Calculate RPO & RTO metrics
         rpo_seconds = (disaster_declared_dt - backup_created_at_dt).total_seconds()
         rto_seconds = (completed_dt - disaster_declared_dt).total_seconds()
 
         return RecoveryResult(
             run_id=self.run_id,
-            status="SUCCESS" if self.current_state == RecoveryState.RECOVERY_COMPLETED else "FAILED",
-            current_state=self.current_state,
+            status="SUCCESS" if final_state == RecoveryState.RECOVERY_COMPLETED else "FAILED",
+            current_state=final_state,
             completed_steps=self.completed_steps,
             failed_step=failed_stage,
             fencing_result=fencing_res.to_dict() if fencing_res else None,
@@ -301,31 +299,27 @@ class RecoveryManager:
         )
 
     def _apply_key_vault_security_bindings(self) -> None:
-        """Fetches sensitive certs/keys from Azure Key Vault to restricted temp files, applies via TSM, then cleans up."""
         kv_name = self.config.azure["key_vault_name"]
         kv_uri = f"https://{kv_name}.vault.azure.net"
         credential = DefaultAzureCredential()
         secret_client = SecretClient(vault_url=kv_uri, credential=credential)
 
-        # Retrieve secret reference
         ssl_cert_secret = secret_client.get_secret("tableau-dr-ssl-cert")
         ssl_key_secret = secret_client.get_secret("tableau-dr-ssl-key")
 
-        # Create temporary, secure directory for certificate binding
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             cert_file = temp_path / "ssl_cert.crt"
             key_file = temp_path / "ssl_key.key"
 
-            # Write secrets with restricted filesystem permissions (owner read/write only: 0o600)
             cert_file.write_text(ssl_cert_secret.value, encoding="utf-8")
             key_file.write_text(ssl_key_secret.value, encoding="utf-8")
-            
+
             if os.name != "nt":
                 os.chmod(cert_file, 0o600)
                 os.chmod(key_file, 0o600)
 
-            logger.info("Applying secure SSL bindings via TSM...")
+            logger.info("Applying SSL configuration bindings via TSM...")
             self.tsm.run([
                 "security", "external-ssl", "enable",
                 "--cert-file", str(cert_file),
