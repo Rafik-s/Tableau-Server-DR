@@ -6,12 +6,18 @@ tableau-server-tsm-dr/
 ├── config/
 │   └── config.yaml.example          # Sample configuration file
 │
-├── tableau_dr/
-│   ├── __init__.py
-│   ├── config_parser_class.py       # Reads and validates YAML configuration
-│   ├── env_manager.py              # Handles Azure authentication & Key Vault secrets
-│   ├── tab_server_connector.py     # Executes TSM CLI commands (backup, restore, SAML, SSL)
-│   └── utils.py                    # Logging, path handling, and AzCopy execution wrappers
+     ├── tableau_dr/
+        │
+        ├── __init__.py
+        ├── exceptions.py
+        ├── config.py
+        ├── logger.py
+        ├── security.py
+        ├── validation.py
+        ├── tab_server_connector.py
+        ├── azure_manager.py
+        ├── backup_manager.py
+        └── execute_backup.py
 │
 ├── .gitignore
 ├── defaults.py                      # Default configuration constants and file paths
@@ -19,7 +25,7 @@ tableau-server-tsm-dr/
 ├── README.md
 ├── 
 ├── requirements.txt                 # Python dependencies
-├── tableau_dr.py                    # Main CLI interface for running scheduled backups
+├── 
 └── validate_prepare_env.ps1         # PowerShell script to validate WinRM, Azure CLI, and TSM permissions
 
 
