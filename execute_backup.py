@@ -31,12 +31,12 @@ def main() -> int:
         result = manager.execute_backup_pipeline()
 
         if result.status != "SUCCESS":
-        logger.error("Backup pipeline returned a non-success status.")
-        return 1
+            logger.error("Backup pipeline returned a non-success status.")
+            return 1
 
         if not result.remote_verified:
-        logger.error("Backup completed but remote verification did not pass.")
-        return 1
+            logger.error("Backup completed but remote verification did not pass.")
+            return 1
 
         if result.cleanup_status == "FAILED":
             logger.warning("Backup complete and verified remotely, but local staging cleanup failed.")
@@ -46,8 +46,8 @@ def main() -> int:
         return 0
     except Exception as e:
         logger.critical(f"FATAL: Backup Execution Failed: {e}")
-        raise SystemExit(main())
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
