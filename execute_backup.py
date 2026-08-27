@@ -30,6 +30,13 @@ def main():
         manager = BackupManager(config=config, run_id=run_id)
         result = manager.execute_backup_pipeline()
 
+        if result.status != "SUCCESS":
+        logger.error("Backup pipeline returned a non-success status.")
+        sys.exit(1)
+
+        if not result.remote_verified:
+        logger.error("Backup completed but remote verification did not pass.")
+        sys.exit(1)
         if result.cleanup_status == "FAILED":
             logger.warning("Backup complete and verified remotely, but local staging cleanup failed.")
             sys.exit(0)
