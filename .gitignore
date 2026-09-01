@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Tableau backup artifacts
+*.tsbak
+
+# Runtime/staging directories
+backups/
+recovery/
+staging/
+logs/
+
+# Local configuration
+config/config.yaml
+
+# Generated manifests
+manifest_*.json
+
+# Logs
+*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
