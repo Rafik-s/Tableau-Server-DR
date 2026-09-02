@@ -1,37 +1,43 @@
 # Tableau Server DR - Example Configuration
 # -------------------------------------------------------------------
-# This file is a TEMPLATE only.
-# DO NOT place passwords, secrets, tokens, private keys, or certificates
-# in this file.
+# TEMPLATE ONLY
 #
-# Copy this file to config.yaml and populate environment-specific values.
+# DO NOT place passwords, secrets, tokens, private keys, certificates,
+# or other sensitive credentials in this file.
+#
+# Copy this file to config.yaml and replace all environment-specific
+# values before executing the DR framework.
 # -------------------------------------------------------------------
 
 environment:
-  version: "2025.x"
-  name: "production"
+  # Tableau Server version deployed in the environment.
+  version: "2025.1.0"
 
 azure:
   # Azure Key Vault containing DR security material.
-  key_vault_name: "YOUR_KEY_VAULT_NAME"
+  key_vault_name: "kv-tableau-dr-prod"
 
   # Azure Storage Account used for DR backup persistence.
-  storage_account_name: "YOUR_STORAGE_ACCOUNT_NAME"
+  #
+  # Must be 3-24 characters, lowercase letters and numbers only.
+  storage_account_name: "sttableaudrprod"
 
   # Blob container used for Tableau DR backups.
+  #
+  # Must comply with Azure Blob Storage container naming rules.
   storage_container: "tableau-dr-backups"
 
   # Azure SDK retry configuration.
   max_retries: 3
-  retry_initial_backoff_seconds: 2
+  retry_backoff_factor: 0.8
 
 servers:
   production:
-    hostname: "YOUR_PRODUCTION_TABLEAU_HOSTNAME"
+    hostname: "tableau-prod.example.internal"
     identity_store: "activedirectory"
 
   disaster_recovery:
-    hostname: "YOUR_DR_TABLEAU_HOSTNAME"
+    hostname: "tableau-dr.example.internal"
     identity_store: "activedirectory"
 
 paths:
@@ -42,39 +48,49 @@ paths:
   recovery_work_dir: "D:/TableauDR/recovery"
 
 backup:
-  # Minimum free disk space required before starting a backup.
-  minimum_free_space_gb: 50
+  # Minimum free disk space required before backup/recovery operations.
+  minimum_free_space_gb: 50.0
 
   # Minimum accepted Tableau repository backup size.
-  minimum_backup_size_mb: 10
+  minimum_backup_size_mb: 10.0
 
-  # When true, downloaded Azure blobs are streamed and re-hashed
-  # using SHA-256 after upload.
+  # When true, Azure blobs are streamed and re-hashed using SHA-256
+  # during remote verification.
+  #
+  # Recommended for higher-assurance environments.
   verify_remote_content_sha256: false
 
 tsm:
   # Optional.
   #
-  # If omitted, TSMConnector resolves the executable in this order:
+  # If omitted, TSMConnector resolves the executable using:
   #
-  # 1. Constructor argument
+  # 1. Explicit constructor argument
   # 2. This YAML value
   # 3. TSM_EXECUTABLE environment variable
-  # 4. OS default PATH lookup
+  # 4. OS PATH lookup
   #
   # Windows example:
-  # executable: "C:/Program Files/Tableau/Tableau Server/packages/bin.2025.1.0/tsm.cmd"
+  # executable: "C:/Program Files/Tableau/Tableau Server/packages/bin.20251.0.0/tsm.cmd"
   #
   # Linux example:
   # executable: "/opt/tableau/tableau_server/packages/bin/tsm"
-
+  #
   executable: ""
 
 security:
-  # Keep security-related configuration here.
-  # Do NOT store actual credentials or private keys in this file.
+  # Production fencing must be explicitly confirmed before recovery.
+  #
+  # Set these according to your organization's external fencing process.
+  production_fencing_enabled: false
+  production_fencing_confirmed: false
 
-  # Secret names are identifiers only; the actual values remain in
-  # Azure Key Vault.
-  ssl_certificate_secret_name: "tableau-dr-ssl-cert"
-  ssl_private_key_secret_name: "tableau-dr-ssl-key"
+  # Emergency authorization is intended for exceptional situations
+  # where normal production fencing confirmation is unavailable.
+  #
+  # NEVER store the real authorization code in this file.
+  #
+  # The actual secret should ultimately be retrieved from a secure
+  # secret-management system such as Azure Key Vault.
+  emergency_fencing_auth_code: "CHANGE_ME_IN_SECURE_VAULT"
+  
