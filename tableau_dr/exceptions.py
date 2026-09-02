@@ -4,7 +4,12 @@ from __future__ import annotations
 
 
 class TableauDRError(Exception):
-    """Base exception for all Tableau DR framework failures."""
+    """
+    Base exception for all expected Tableau DR framework failures.
+
+    Application code should catch this hierarchy for controlled failures
+    rather than catching broad Exception types.
+    """
 
 
 class ConfigurationError(TableauDRError):
@@ -12,7 +17,7 @@ class ConfigurationError(TableauDRError):
 
 
 class ValidationError(TableauDRError):
-    """Raised when a required operational validation fails."""
+    """Raised when an operational validation fails."""
 
 
 class SecurityValidationError(ValidationError):
@@ -32,7 +37,7 @@ class AzureError(TableauDRError):
 
 
 class RecoveryError(TableauDRError):
-    """Raised when the disaster recovery state machine cannot continue."""
+    """Raised when the disaster recovery workflow cannot continue."""
 
 
 class FencingError(SecurityValidationError):
