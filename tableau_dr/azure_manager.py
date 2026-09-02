@@ -1,4 +1,12 @@
-"""Secure Azure Blob Storage integration for Tableau DR artifacts."""
+"""
+Secure Azure Blob Storage integration for Tableau DR artifacts.
+
+Authentication uses DefaultAzureCredential only. Storage account keys,
+connection strings, and SAS tokens are intentionally not supported.
+
+All uploaded recovery artifacts carry SHA-256 and size metadata and can
+optionally be verified by streaming the complete remote object.
+"""
 
 from __future__ import annotations
 
@@ -15,10 +23,14 @@ from azure.core.pipeline.policies import ExponentialRetry
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
-from tableau_dr.exceptions import IntegrityError, SecurityValidationError
+from tableau_dr.exceptions import (
+    IntegrityError,
+    SecurityValidationError,
+)
 
 
 logger = logging.getLogger(__name__)
+
 
 SHA256_LENGTH = 64
 DEFAULT_MAX_RETRIES = 3
@@ -26,10 +38,13 @@ DEFAULT_BACKOFF_FACTOR = 0.8
 HASH_BLOCK_SIZE = 64 * 1024
 
 MAX_BLOB_PATH_LENGTH = 1024
+MAX_BLOB_SIZE_BYTES = 1 * 1024 * 1024 * 1024 * 1024  # 1 TiB
+
 
 _SECRET_PATTERN = re.compile(
-    r"(?i)(password|passwd|passphrase|secret|token|access[-_ ]?token|"
-    r"client[-_ ]?secret|sas[-_ ]?token)\s*[:=]\s*[^\s,;]+"
+    r"(?i)(password|passwd|passphrase|secret|token|"
+    r"access[-_ ]?token|client[-_ ]?secret|sas[-_ ]?token)"
+    r"\s*[:=]\s*[^\s,;]+"
 )
 
 
@@ -44,20 +59,22 @@ class AzureManager:
         backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
     ) -> None:
         """
-        Initialize an Azure Blob client using managed/default credentials.
+        Initialize Azure Blob Storage using managed/default identity.
 
-        No storage keys, SAS tokens, or connection strings are accepted.
-        Authentication is delegated to DefaultAzureCredential.
+        No storage account keys, SAS tokens, or connection strings are
+        accepted by this class.
         """
 
-        self.account_name = self._validate_name(
-            account_name,
-            "Azure storage account name",
+        self.account_name = (
+            self._validate_storage_account_name(
+                account_name
+            )
         )
 
-        self.container_name = self._validate_name(
-            container_name,
-            "Azure container name",
+        self.container_name = (
+            self._validate_container_name(
+                container_name
+            )
         )
 
         self._validate_retry_configuration(
@@ -75,7 +92,9 @@ class AzureManager:
             )
 
             retry_policy = ExponentialRetry(
-                initial_backoff=float(backoff_factor),
+                initial_backoff=float(
+                    backoff_factor
+                ),
                 max_attempts=max_retries,
                 random_jitter_range=1,
             )
@@ -102,31 +121,85 @@ class AzureManager:
             ) from exc
 
     # ------------------------------------------------------------------
-    # Validation
+    # Azure resource validation
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _validate_name(
+    def _validate_storage_account_name(
         value: str,
-        description: str,
     ) -> str:
-        """Validate a required Azure resource name."""
+        """Validate an Azure Storage Account name."""
 
-        if not isinstance(value, str):
-            raise ValueError(
-                f"{description} must be a string."
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise SecurityValidationError(
+                "Azure storage account name must be a string."
             )
 
         normalized = value.strip()
 
-        if not normalized:
-            raise ValueError(
-                f"{description} must be a non-empty string."
+        if not (
+            3 <= len(normalized) <= 24
+        ):
+            raise SecurityValidationError(
+                "Azure storage account name length is invalid."
             )
 
-        if len(normalized) > 255:
-            raise ValueError(
-                f"{description} is too long."
+        if normalized != normalized.lower():
+            raise SecurityValidationError(
+                "Azure storage account name must use lowercase characters."
+            )
+
+        if not normalized.isalnum():
+            raise SecurityValidationError(
+                "Azure storage account name must contain only "
+                "letters and numbers."
+            )
+
+        return normalized
+
+    @staticmethod
+    def _validate_container_name(
+        value: str,
+    ) -> str:
+        """Validate an Azure Blob container name."""
+
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise SecurityValidationError(
+                "Azure container name must be a string."
+            )
+
+        normalized = value.strip()
+
+        if not (
+            3 <= len(normalized) <= 63
+        ):
+            raise SecurityValidationError(
+                "Azure container name length is invalid."
+            )
+
+        if (
+            normalized.startswith("-")
+            or normalized.endswith("-")
+            or "--" in normalized
+        ):
+            raise SecurityValidationError(
+                "Azure container name has invalid hyphen placement."
+            )
+
+        if not all(
+            character.islower()
+            or character.isdigit()
+            or character == "-"
+            for character in normalized
+        ):
+            raise SecurityValidationError(
+                "Azure container name contains invalid characters."
             )
 
         return normalized
@@ -136,26 +209,35 @@ class AzureManager:
         max_retries: int,
         backoff_factor: float,
     ) -> None:
-        """Validate retry settings."""
+        """Validate Azure retry configuration."""
 
         if (
             isinstance(max_retries, bool)
             or not isinstance(max_retries, int)
             or max_retries < 1
         ):
-            raise ValueError(
+            raise SecurityValidationError(
                 "max_retries must be an integer greater than zero."
             )
 
         if (
             isinstance(backoff_factor, bool)
-            or not isinstance(backoff_factor, (int, float))
-            or not math.isfinite(float(backoff_factor))
+            or not isinstance(
+                backoff_factor,
+                (int, float),
+            )
+            or not math.isfinite(
+                float(backoff_factor)
+            )
             or backoff_factor <= 0
         ):
-            raise ValueError(
+            raise SecurityValidationError(
                 "backoff_factor must be a finite number greater than zero."
             )
+
+    # ------------------------------------------------------------------
+    # Blob path validation
+    # ------------------------------------------------------------------
 
     @classmethod
     def validate_blob_path(
@@ -163,24 +245,32 @@ class AzureManager:
         blob_path: str,
     ) -> str:
         """
-        Validate and normalize an Azure Blob object path.
+        Validate and normalize a complete Azure Blob object path.
 
         Prevents:
-        - absolute paths
-        - traversal components
-        - null bytes
-        - empty path components
-        - excessively long paths
+            - absolute paths
+            - traversal components
+            - null bytes
+            - empty path components
+            - drive-qualified paths
+            - excessively long paths
         """
 
-        if not isinstance(blob_path, str):
+        if not isinstance(
+            blob_path,
+            str,
+        ):
             raise SecurityValidationError(
                 "Blob path must be a string."
             )
 
-        normalized = blob_path.strip().replace(
-            "\\",
-            "/",
+        normalized = (
+            blob_path
+            .strip()
+            .replace(
+                "\\",
+                "/",
+            )
         )
 
         if not normalized:
@@ -211,11 +301,24 @@ class AzureManager:
         parts = normalized.split("/")
 
         if any(
-            part in {"", ".", ".."}
+            part in {
+                "",
+                ".",
+                "..",
+            }
             for part in parts
         ):
             raise SecurityValidationError(
                 "Blob path contains an invalid path component."
+            )
+
+        if any(
+            ord(character) < 32
+            or ord(character) == 127
+            for character in normalized
+        ):
+            raise SecurityValidationError(
+                "Blob path contains invalid control characters."
             )
 
         return normalized
@@ -225,14 +328,97 @@ class AzureManager:
         cls,
         blob_path: str,
     ) -> str:
-        """
-        Backward-compatible private wrapper.
+        """Backward-compatible private blob-path validator."""
 
-        Internal callers may continue using the private method,
-        while new callers should use validate_blob_path().
+        return cls.validate_blob_path(
+            blob_path
+        )
+
+    @classmethod
+    def _validate_blob_prefix(
+        cls,
+        prefix: str,
+    ) -> str:
+        """
+        Validate a Blob listing prefix.
+
+        Unlike a complete Blob path, a prefix may intentionally end with
+        '/' because Azure uses it as a name filter.
         """
 
-        return cls.validate_blob_path(blob_path)
+        if not isinstance(
+            prefix,
+            str,
+        ):
+            raise SecurityValidationError(
+                "Blob prefix must be a string."
+            )
+
+        normalized = (
+            prefix
+            .strip()
+            .replace(
+                "\\",
+                "/",
+            )
+        )
+
+        if not normalized:
+            raise SecurityValidationError(
+                "Blob prefix must not be empty."
+            )
+
+        if len(normalized) > MAX_BLOB_PATH_LENGTH:
+            raise SecurityValidationError(
+                "Blob prefix is too long."
+            )
+
+        if normalized.startswith("/"):
+            raise SecurityValidationError(
+                "Blob prefix must not begin with '/'."
+            )
+
+        if ":" in normalized:
+            raise SecurityValidationError(
+                "Drive-qualified Blob prefixes are not permitted."
+            )
+
+        if "\x00" in normalized:
+            raise SecurityValidationError(
+                "Blob prefix contains an invalid null character."
+            )
+
+        if any(
+            ord(character) < 32
+            or ord(character) == 127
+            for character in normalized
+        ):
+            raise SecurityValidationError(
+                "Blob prefix contains invalid control characters."
+            )
+
+        # Prefixes may end with '/', but internal empty components and
+        # traversal components remain forbidden.
+        parts = normalized.split("/")
+
+        for index, part in enumerate(parts):
+            if index == len(parts) - 1 and part == "":
+                continue
+
+            if part in {
+                "",
+                ".",
+                "..",
+            }:
+                raise SecurityValidationError(
+                    "Blob prefix contains an invalid path component."
+                )
+
+        return normalized
+
+    # ------------------------------------------------------------------
+    # SHA-256 validation
+    # ------------------------------------------------------------------
 
     @classmethod
     def validate_sha256(
@@ -241,7 +427,10 @@ class AzureManager:
     ) -> str:
         """Validate and normalize a SHA-256 hexadecimal digest."""
 
-        if not isinstance(checksum, str):
+        if not isinstance(
+            checksum,
+            str,
+        ):
             raise SecurityValidationError(
                 "SHA-256 checksum must be a string."
             )
@@ -266,9 +455,11 @@ class AzureManager:
         cls,
         checksum: str,
     ) -> str:
-        """Backward-compatible private wrapper."""
+        """Backward-compatible private SHA-256 validator."""
 
-        return cls.validate_sha256(checksum)
+        return cls.validate_sha256(
+            checksum
+        )
 
     # ------------------------------------------------------------------
     # Error handling
@@ -278,7 +469,7 @@ class AzureManager:
     def _sanitize_error(
         value: object,
     ) -> str:
-        """Remove common secret-like values from Azure error text."""
+        """Remove common secret-like values from error text."""
 
         text = str(value)
 
@@ -290,14 +481,14 @@ class AzureManager:
         )
 
     # ------------------------------------------------------------------
-    # Blob access helpers
+    # Blob client helpers
     # ------------------------------------------------------------------
 
     def _get_blob_client(
         self,
         blob_path: str,
     ):
-        """Return a validated BlobClient."""
+        """Return a BlobClient for a validated object path."""
 
         normalized_blob_path = (
             self.validate_blob_path(
@@ -309,16 +500,15 @@ class AzureManager:
             normalized_blob_path
         )
 
+    # ------------------------------------------------------------------
+    # Remote metadata
+    # ------------------------------------------------------------------
+
     def get_blob_properties(
         self,
         blob_path: str,
     ):
-        """
-        Retrieve remote Blob properties.
-
-        Azure errors are intentionally wrapped to avoid exposing
-        infrastructure details to higher layers.
-        """
+        """Retrieve remote Blob properties safely."""
 
         blob_client = self._get_blob_client(
             blob_path
@@ -341,6 +531,10 @@ class AzureManager:
                 "Unable to retrieve remote Blob properties."
             ) from exc
 
+    # ------------------------------------------------------------------
+    # Remote streaming
+    # ------------------------------------------------------------------
+
     def download_blob_stream(
         self,
         blob_path: str,
@@ -348,8 +542,8 @@ class AzureManager:
         """
         Return an Azure download stream.
 
-        The caller is responsible for enforcing any application-specific
-        maximum streaming size.
+        Application-level callers are responsible for enforcing their
+        own streaming size limits.
         """
 
         blob_client = self._get_blob_client(
@@ -373,21 +567,23 @@ class AzureManager:
                 "Unable to download remote Blob."
             ) from exc
 
+    # ------------------------------------------------------------------
+    # Blob listing
+    # ------------------------------------------------------------------
+
     def list_blobs(
         self,
         prefix: str | None = None,
     ) -> Iterable[Any]:
-        """
-        List Blob objects from the configured container.
-
-        The optional prefix is validated before being sent to Azure.
-        """
+        """List Blobs using an optionally validated prefix."""
 
         normalized_prefix: str | None = None
 
         if prefix is not None:
             normalized_prefix = (
-                self.validate_blob_path(prefix)
+                self._validate_blob_prefix(
+                    prefix
+                )
             )
 
         try:
@@ -415,10 +611,10 @@ class AzureManager:
         sha256_checksum: str,
     ) -> str:
         """
-        Upload a local artifact and store its SHA-256 as Blob metadata.
+        Upload a local artifact and store SHA-256 and size metadata.
 
-        Existing blobs are intentionally overwritten because the caller
-        controls the unique run-specific blob path.
+        Existing objects may be overwritten because the backup manager
+        generates run-specific Blob paths.
         """
 
         file_path = Path(
@@ -439,7 +635,7 @@ class AzureManager:
 
         if not file_path.exists():
             raise FileNotFoundError(
-                f"Local artifact does not exist: {file_path}"
+                "Local artifact does not exist."
             )
 
         if not file_path.is_file():
@@ -460,13 +656,22 @@ class AzureManager:
                 "Refusing to upload empty artifact."
             )
 
-        blob_client = self.container_client.get_blob_client(
-            normalized_blob_path
+        if file_size > MAX_BLOB_SIZE_BYTES:
+            raise SecurityValidationError(
+                "Local artifact exceeds the maximum supported size."
+            )
+
+        blob_client = (
+            self.container_client.get_blob_client(
+                normalized_blob_path
+            )
         )
 
         metadata = {
             "sha256": expected_sha256,
-            "size_bytes": str(file_size),
+            "size_bytes": str(
+                file_size
+            ),
         }
 
         logger.info(
@@ -515,8 +720,8 @@ class AzureManager:
         """
         Verify remote Blob size and SHA-256 metadata.
 
-        Optional full content streaming verification calculates the SHA-256
-        of the actual remote object.
+        When verify_content_stream is True, the complete remote Blob is
+        streamed and independently hashed.
         """
 
         normalized_blob_path = (
@@ -532,16 +737,29 @@ class AzureManager:
         )
 
         if (
-            isinstance(expected_size_bytes, bool)
-            or not isinstance(expected_size_bytes, int)
+            isinstance(
+                expected_size_bytes,
+                bool,
+            )
+            or not isinstance(
+                expected_size_bytes,
+                int,
+            )
             or expected_size_bytes < 0
         ):
-            raise ValueError(
+            raise SecurityValidationError(
                 "expected_size_bytes must be a non-negative integer."
             )
 
-        blob_client = self.container_client.get_blob_client(
-            normalized_blob_path
+        if expected_size_bytes > MAX_BLOB_SIZE_BYTES:
+            raise SecurityValidationError(
+                "expected_size_bytes exceeds the maximum supported size."
+            )
+
+        blob_client = (
+            self.container_client.get_blob_client(
+                normalized_blob_path
+            )
         )
 
         try:
@@ -550,6 +768,22 @@ class AzureManager:
             )
 
             actual_size = properties.size
+
+            if (
+                not isinstance(
+                    actual_size,
+                    int,
+                )
+                or actual_size < 0
+            ):
+                raise IntegrityError(
+                    "Remote Blob reported an invalid size."
+                )
+
+            if actual_size > MAX_BLOB_SIZE_BYTES:
+                raise IntegrityError(
+                    "Remote Blob exceeds the maximum supported size."
+                )
 
             if actual_size != expected_size_bytes:
                 raise IntegrityError(
@@ -562,7 +796,22 @@ class AzureManager:
 
             remote_sha256 = (
                 remote_metadata
-                .get("sha256", "")
+                .get(
+                    "sha256",
+                    "",
+                )
+            )
+
+            if not isinstance(
+                remote_sha256,
+                str,
+            ):
+                raise SecurityValidationError(
+                    "Remote Blob SHA-256 metadata is invalid."
+                )
+
+            remote_sha256 = (
+                remote_sha256
                 .strip()
                 .lower()
             )
@@ -598,25 +847,35 @@ class AzureManager:
                 )
             )
 
-            if metadata_size is not None:
-                try:
-                    parsed_metadata_size = int(
-                        metadata_size
-                    )
+            if metadata_size is None:
+                raise SecurityValidationError(
+                    "Remote Blob is missing size metadata."
+                )
 
-                except (TypeError, ValueError) as exc:
-                    raise SecurityValidationError(
-                        "Remote Blob contains invalid size metadata."
-                    ) from exc
+            try:
+                parsed_metadata_size = int(
+                    metadata_size
+                )
 
-                if parsed_metadata_size != expected_size_bytes:
-                    raise IntegrityError(
-                        "Remote Blob metadata size mismatch."
-                    )
+            except (
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise SecurityValidationError(
+                    "Remote Blob contains invalid size metadata."
+                ) from exc
+
+            if (
+                parsed_metadata_size
+                != expected_size_bytes
+            ):
+                raise IntegrityError(
+                    "Remote Blob metadata size mismatch."
+                )
 
             if verify_content_stream:
                 logger.info(
-                    "Performing full content SHA-256 verification."
+                    "Performing full remote content SHA-256 verification."
                 )
 
                 download_stream = (
@@ -625,7 +884,8 @@ class AzureManager:
 
                 actual_content_sha256 = (
                     self._hash_stream(
-                        download_stream
+                        download_stream,
+                        expected_size_bytes,
                     )
                 )
 
@@ -716,17 +976,42 @@ class AzureManager:
     @staticmethod
     def _hash_stream(
         stream,
+        expected_size_bytes: int | None = None,
     ) -> str:
-        """Calculate SHA-256 from an Azure download stream."""
+        """
+        Calculate SHA-256 from an Azure download stream.
+
+        If an expected size is supplied, the stream is fail-closed if
+        more data than expected is returned.
+        """
 
         digest = hashlib.sha256()
+        total_bytes = 0
 
         for chunk in stream.chunks(
             chunk_size=HASH_BLOCK_SIZE
         ):
-            if chunk:
-                digest.update(
-                    chunk
+            if not chunk:
+                continue
+
+            total_bytes += len(chunk)
+
+            if (
+                expected_size_bytes is not None
+                and total_bytes > expected_size_bytes
+            ):
+                raise IntegrityError(
+                    "Remote Blob stream exceeded expected size."
                 )
+
+            digest.update(chunk)
+
+        if (
+            expected_size_bytes is not None
+            and total_bytes != expected_size_bytes
+        ):
+            raise IntegrityError(
+                "Remote Blob stream size does not match expected size."
+            )
 
         return digest.hexdigest()
