@@ -27,6 +27,7 @@ Security principles:
 - Never reuse a recovery workspace.
 - Never report successful recovery unless health validation succeeds.
 - Recovery run IDs and backup run IDs are independent identifiers.
+- Temporary private-key files receive restrictive operating-system permissions.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -50,6 +52,7 @@ from azure.keyvault.secrets import SecretClient
 
 from .azure_manager import AzureManager
 from .config import Config
+from .exceptions import RecoveryError
 from .fencing import FencingResult, ProductionFencer
 from .health_check import HealthCheckResult, HealthChecker
 from .security import sha256_file
@@ -58,10 +61,6 @@ from .validation import validate_identity_store, validate_tableau_version
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-class RecoveryError(Exception):
-    """Controlled recovery failure."""
 
 
 class RecoveryState(str, enum.Enum):
@@ -128,6 +127,8 @@ class RecoveryManager:
         r"^[A-Za-z0-9_.-]+$"
     )
 
+    WINDOWS_ACL_TIMEOUT_SECONDS = 30
+
     def __init__(
         self,
         config: Config,
@@ -140,7 +141,7 @@ class RecoveryManager:
 
         self.tsm = TSMConnector(
             config=config,
-            logger=self.logger,
+            logger_instance=self.logger,
         )
 
         self.azure = AzureManager(
@@ -152,12 +153,15 @@ class RecoveryManager:
 
         self.fencer = ProductionFencer(
             config=config,
-            logger=self.logger,
         )
 
+        dr_hostname = str(
+            config.servers["disaster_recovery"]["hostname"]
+        ).strip()
+
         self.health_checker = HealthChecker(
-            config=config,
-            logger=self.logger,
+            tsm_connector=self.tsm,
+            gateway_hostname=dr_hostname,
         )
 
         self.current_state = RecoveryState.DISASTER_DECLARED
@@ -189,7 +193,7 @@ class RecoveryManager:
     def execute_failover(
         self,
         *,
-        manifest_blob: Optional[str] = None,
+        target_manifest_blob: Optional[str] = None,
         emergency_auth_code: Optional[str] = None,
         operator_reason: Optional[str] = None,
     ) -> RecoveryResult:
@@ -224,7 +228,7 @@ class RecoveryManager:
             self._execute_stage(
                 RecoveryState.MANIFEST_VALIDATED,
                 self._acquire_and_validate_manifest,
-                manifest_blob,
+                target_manifest_blob,
             )
 
             self._execute_stage(
@@ -266,6 +270,8 @@ class RecoveryManager:
             self.completed_steps.append(
                 self.current_state.value
             )
+
+            self.failed_step = None
 
             self.recovery_completed_at = (
                 dt.datetime.now(dt.timezone.utc)
@@ -458,17 +464,24 @@ class RecoveryManager:
         if operator_reason is not None:
             operator_reason = operator_reason.strip()
 
+            if not operator_reason:
+                raise RecoveryError(
+                    "Operator reason cannot be empty"
+                )
+
             if len(operator_reason) > 1000:
                 raise RecoveryError(
                     "Operator reason exceeds maximum length"
                 )
 
-        self.fencing_result = self.fencer.fence(
-            emergency_auth_code=emergency_auth_code,
-            operator_reason=operator_reason,
+        self.fencing_result = (
+            self.fencer.evaluate_fencing(
+                emergency_authorization_code=emergency_auth_code,
+                operator_reason=operator_reason,
+            )
         )
 
-        if not self.fencing_result.success:
+        if not self.fencing_result.is_fenced:
             raise RecoveryError(
                 "Production fencing was not confirmed"
             )
@@ -481,7 +494,7 @@ class RecoveryManager:
                 "Fencing result is unavailable"
             )
 
-        if not self.fencing_result.success:
+        if not self.fencing_result.is_fenced:
             raise RecoveryError(
                 "Production fencing failed"
             )
@@ -603,6 +616,11 @@ class RecoveryManager:
         else:
             blob_name = (
                 self._resolve_latest_manifest_blob()
+            )
+
+        if not blob_name.endswith(".json"):
+            raise RecoveryError(
+                "Recovery manifest must be a JSON object"
             )
 
         local_manifest = (
@@ -829,10 +847,6 @@ class RecoveryManager:
                 "Manifest is not marked ARTIFACTS_READY"
             )
 
-        # The backup run ID identifies the backup operation.
-        # It must be independently valid but must not equal the
-        # recovery run ID because recovery normally restores a
-        # backup created during an earlier operation.
         manifest_run_id = manifest.get(
             "run_id"
         )
@@ -1073,9 +1087,6 @@ class RecoveryManager:
             validated_blob_path.endswith(
                 f"/{logical_name}"
             )
-            or validated_blob_path.endswith(
-                logical_name
-            )
         ):
             raise RecoveryError(
                 "Artifact blob path does not match "
@@ -1217,7 +1228,11 @@ class RecoveryManager:
             )
         )
 
-        if maximum_size <= 0:
+        if (
+            isinstance(maximum_size, bool)
+            or not isinstance(maximum_size, int)
+            or maximum_size <= 0
+        ):
             raise RecoveryError(
                 "Invalid maximum download size"
             )
@@ -1286,7 +1301,8 @@ class RecoveryManager:
         )
 
         if (
-            not isinstance(
+            isinstance(remote_size, bool)
+            or not isinstance(
                 remote_size,
                 int,
             )
@@ -1652,7 +1668,7 @@ class RecoveryManager:
             [
                 "settings",
                 "import",
-                "-f",
+                "--input-config",
                 str(settings_file),
             ]
         )
@@ -1806,12 +1822,22 @@ class RecoveryManager:
                     cert_path.parent
                 )
 
-    @staticmethod
+    @classmethod
     def _write_secret_file(
+        cls,
         path: Path,
         value: str,
     ) -> None:
-        """Write a temporary secret file with restrictive permissions."""
+        """
+        Write a temporary secret file with restrictive permissions.
+
+        POSIX:
+            0600 file permissions.
+
+        Windows:
+            Inherited ACLs are removed and access is explicitly granted
+            to the current user, SYSTEM, and local Administrators.
+        """
 
         if not isinstance(
             value,
@@ -1821,19 +1847,147 @@ class RecoveryManager:
                 "Secret value is invalid"
             )
 
-        try:
-            path.write_text(
-                value,
-                encoding="utf-8",
+        if not isinstance(
+            path,
+            Path,
+        ):
+            raise RecoveryError(
+                "Secret file path is invalid"
             )
+
+        try:
+            path.parent.mkdir(
+                mode=0o700,
+                parents=True,
+                exist_ok=True,
+            )
+
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+            )
+
+            fd = os.open(
+                path,
+                flags,
+                0o600,
+            )
+
+            try:
+                with os.fdopen(
+                    fd,
+                    "w",
+                    encoding="utf-8",
+                ) as secret_file:
+                    secret_file.write(value)
+
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
 
             if os.name != "nt":
                 path.chmod(0o600)
+                return
+
+            cls._restrict_windows_file_acl(
+                path
+            )
+
+        except RecoveryError:
+            cls._safe_delete_file(
+                path
+            )
+            raise
 
         except OSError as exc:
+            cls._safe_delete_file(
+                path
+            )
+
             raise RecoveryError(
                 "Unable to create secure temporary secret file"
             ) from exc
+
+    @classmethod
+    def _restrict_windows_file_acl(
+        cls,
+        path: Path,
+    ) -> None:
+        """Restrict a Windows secret file using icacls."""
+
+        if os.name != "nt":
+            raise RecoveryError(
+                "Windows ACL operation requested on non-Windows host"
+            )
+
+        username = os.environ.get(
+            "USERNAME"
+        )
+
+        user_domain = os.environ.get(
+            "USERDOMAIN"
+        )
+
+        if not username:
+            raise RecoveryError(
+                "Unable to determine current Windows user"
+            )
+
+        if user_domain:
+            current_user = (
+                f"{user_domain}\\{username}"
+            )
+        else:
+            current_user = username
+
+        command = [
+            "icacls",
+            str(path),
+            "/inheritance:r",
+            "/grant:r",
+            f"{current_user}:F",
+            "SYSTEM:F",
+            "Administrators:F",
+        ]
+
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=cls.WINDOWS_ACL_TIMEOUT_SECONDS,
+                check=False,
+                shell=False,
+            )
+
+        except (
+            OSError,
+            subprocess.SubprocessError,
+        ) as exc:
+            cls._safe_delete_file(
+                path
+            )
+
+            raise RecoveryError(
+                "Unable to apply Windows ACL to temporary secret file"
+            ) from exc
+
+        if completed.returncode != 0:
+            cls._safe_delete_file(
+                path
+            )
+
+            raise RecoveryError(
+                "Windows ACL restriction failed for temporary secret file"
+            )
 
     # ------------------------------------------------------------------
     # Stage 9 - Start DR
@@ -1859,10 +2013,10 @@ class RecoveryManager:
         """Require successful post-recovery health validation."""
 
         self.health_result = (
-            self.health_checker.check()
+            self.health_checker.run_all_checks()
         )
 
-        if not self.health_result.healthy:
+        if not self.health_result.overall_healthy:
             raise RecoveryError(
                 "DR health validation failed"
             )
