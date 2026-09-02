@@ -1,58 +1,72 @@
-"""Enterprise state-machine Tableau Server DR recovery orchestrator."""
+"""
+Enterprise Tableau Server Disaster Recovery recovery orchestrator.
+
+The recovery workflow is intentionally fail-closed:
+
+    DISASTER_DECLARED
+        -> PRODUCTION_FENCED
+        -> DR_PREFLIGHT_PASSED
+        -> MANIFEST_VALIDATED
+        -> BACKUP_ARTIFACTS_VALIDATED
+        -> DR_STOPPED
+        -> REPOSITORY_RESTORED
+        -> SETTINGS_IMPORTED
+        -> SECURITY_REBOUND
+        -> DR_STARTED
+        -> HEALTH_VALIDATED
+        -> RECOVERY_COMPLETED
+
+Any unexpected failure moves the workflow to FAILED.
+
+Security principles:
+- Never trust artifact names or blob paths from the manifest.
+- Never restore an artifact whose integrity has not been validated.
+- Never continue after a fencing failure.
+- Never expose Key Vault secrets in logs.
+- Never reuse a recovery workspace.
+- Never report a successful recovery unless health validation succeeds.
+"""
 
 from __future__ import annotations
 
-import datetime
+import datetime as dt
 import enum
+import hashlib
+import hmac
 import json
 import logging
 import os
+import re
+import shutil
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from azure.core.exceptions import AzureError
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 
-from tableau_dr.azure_manager import AzureManager
-from tableau_dr.config import Config
-from tableau_dr.exceptions import (
-    IntegrityError,
-    RecoveryError,
-    SecurityValidationError,
-    ValidationError,
-)
-from tableau_dr.fencing import FencingResult, ProductionFencer
-from tableau_dr.health_check import HealthCheckResult, HealthChecker
-from tableau_dr.security import sha256_file, validate_file
-from tableau_dr.tab_server_connector import TSMConnector
-from tableau_dr.validation import (
-    validate_disk_space,
-    validate_identity_store,
-    validate_tableau_version,
-)
+from .azure_manager import AzureManager
+from .config import Config
+from .fencing import FencingResult, ProductionFencer
+from .health_check import HealthCheckResult, HealthChecker
+from .security import sha256_file
+from .tab_server_connector import TSMConnector
+from .validation import validate_identity_store, validate_tableau_version
 
 
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
-MANIFEST_VERSION = "2.0"
-EXPECTED_MANIFEST_STATUS = "ARTIFACTS_READY"
 
-BACKUP_ARTIFACT_KEY = "backup.tsbak"
-SETTINGS_ARTIFACT_KEY = "settings.json"
-
-DEFAULT_MIN_FREE_SPACE_GB = 50.0
-DEFAULT_RECOVERY_TIMEOUT_SECONDS = 14_400
-
-MAX_MANIFEST_SIZE_BYTES = 10 * 1024 * 1024
-MAX_ARTIFACT_FILENAME_LENGTH = 255
+class RecoveryError(Exception):
+    """Controlled recovery failure."""
 
 
 class RecoveryState(str, enum.Enum):
-    """States used by the fail-closed recovery state machine."""
+    """Recovery state machine states."""
 
     DISASTER_DECLARED = "DISASTER_DECLARED"
     FENCING_PENDING = "FENCING_PENDING"
@@ -71,1384 +85,1589 @@ class RecoveryState(str, enum.Enum):
 
 
 @dataclass
-class StageTiming:
-    """Timing information for an individual recovery stage."""
-
-    started_at: str
-    completed_at: str
-    duration_seconds: float
-
-
-@dataclass
 class RecoveryResult:
-    """Machine-readable result of a DR recovery execution."""
+    """Structured result returned by the recovery workflow."""
 
     run_id: str
     status: str
-    current_state: RecoveryState
-    completed_steps: List[RecoveryState]
-    failed_step: Optional[RecoveryState]
-    fencing_result: Optional[dict]
-    health_result: Optional[dict]
+    current_state: str
+    completed_steps: List[str]
+    failed_step: Optional[str]
+    fencing_result: Optional[Dict[str, Any]]
+    health_result: Optional[Dict[str, Any]]
     disaster_declared_at_utc: str
-    recovery_completed_at_utc: str
-    backup_created_at_utc: str
-    measured_backup_age_rpo_seconds: float
-    total_rto_seconds: float
-    stage_timings: Dict[str, dict]
-
-    def to_dict(self) -> dict:
-        """Return a JSON-serializable representation."""
-
-        result = asdict(self)
-
-        result["current_state"] = self.current_state.value
-        result["completed_steps"] = [
-            state.value for state in self.completed_steps
-        ]
-        result["failed_step"] = (
-            self.failed_step.value
-            if self.failed_step
-            else None
-        )
-
-        return result
+    recovery_completed_at_utc: Optional[str]
+    backup_created_at_utc: Optional[str]
+    measured_backup_age_rpo_seconds: Optional[float]
+    total_rto_seconds: Optional[float]
+    stage_timings: Dict[str, float]
 
 
 class RecoveryManager:
     """
-    Execute fail-closed Tableau Server disaster recovery.
-
-    Recovery sequence:
-
-        Disaster Declaration
-            ↓
-        Production Fencing
-            ↓
-        DR Preflight
-            ↓
-        Manifest Acquisition + Validation
-            ↓
-        Artifact Download + Integrity Validation
-            ↓
-        Stop DR
-            ↓
-        Restore Repository
-            ↓
-        Import Settings
-            ↓
-        Rebind Security
-            ↓
-        Start DR
-            ↓
-        Health Validation
-            ↓
-        Recovery Completed
-
-    Any failed stage aborts the state machine. Recovery never proceeds to
-    a later destructive stage when an earlier safety gate has failed.
+    High-level fail-closed Tableau Server disaster recovery orchestrator.
     """
+
+    MANIFEST_VERSION = "2.0"
+    MANIFEST_STATUS = "ARTIFACTS_READY"
+
+    REQUIRED_ARTIFACTS = {
+        "backup.tsbak",
+        "settings.json",
+    }
+
+    MAX_MANIFEST_SIZE_BYTES = 10 * 1024 * 1024
+    MAX_ARTIFACT_SIZE_BYTES = 1024 * 1024 * 1024 * 1024
+    DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
+    SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+    SHA256_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
 
     def __init__(
         self,
         config: Config,
         run_id: str,
+        logger: Optional[logging.Logger] = None,
     ) -> None:
-        """Initialize recovery dependencies and an isolated work directory."""
-
-        if not isinstance(run_id, str) or not run_id.strip():
-            raise ValueError(
-                "run_id must be a non-empty string."
-            )
-
         self.config = config
-        self.run_id = run_id.strip()
-
-        yaml_executable = (
-            config.tsm.get("executable")
-            if config.tsm
-            else None
-        )
+        self.run_id = self._validate_run_id(run_id)
+        self.logger = logger or LOGGER
 
         self.tsm = TSMConnector(
-            yaml_executable=yaml_executable,
+            config=config,
+            logger=self.logger,
         )
-
-        azure_cfg = config.azure
 
         self.azure = AzureManager(
-            account_name=azure_cfg["storage_account_name"],
-            container_name=azure_cfg["storage_container"],
-            max_retries=azure_cfg.get("max_retries", 3),
-            backoff_factor=azure_cfg.get(
-                "retry_backoff_factor",
-                0.8,
-            ),
+            config=config,
+            logger=self.logger,
         )
 
-        self.fencer = ProductionFencer(config)
+        self.fencer = ProductionFencer(
+            config=config,
+            logger=self.logger,
+        )
 
-        self.completed_steps: List[RecoveryState] = []
+        self.health_checker = HealthChecker(
+            config=config,
+            logger=self.logger,
+        )
 
         self.current_state = RecoveryState.DISASTER_DECLARED
+        self.completed_steps: List[str] = []
+        self.stage_timings: Dict[str, float] = {}
 
-        self.stage_timings: Dict[str, StageTiming] = {}
+        self.failed_step: Optional[str] = None
+        self.fencing_result: Optional[FencingResult] = None
+        self.health_result: Optional[HealthCheckResult] = None
 
-        self.work_dir = self._build_work_directory()
+        self.disaster_declared_at = dt.datetime.now(dt.timezone.utc)
+        self.recovery_completed_at: Optional[dt.datetime] = None
 
-    def _build_work_directory(self) -> Path:
-        """Build a run-isolated recovery workspace."""
+        # IMPORTANT:
+        # Do not initialize this to disaster_declared_at.
+        # If the backup timestamp cannot be established, RPO is unknown.
+        self.backup_created_at: Optional[dt.datetime] = None
 
-        base_recovery_dir = Path(
-            self.config.paths["recovery_work_dir"]
-        ).expanduser()
+        self.work_dir: Optional[Path] = None
+        self.manifest: Optional[Dict[str, Any]] = None
 
-        if not str(base_recovery_dir).strip():
-            raise ValidationError(
-                "Recovery work directory cannot be empty."
-            )
+        self._validate_configuration()
 
-        return (
-            base_recovery_dir
-            / f"recovery_{self.run_id}"
-        )
-
-    def _execute_stage(
-        self,
-        target_state: RecoveryState,
-        func: Callable[..., Any],
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        """
-        Execute one state-machine stage.
-
-        The state is assigned before execution so failures are accurately
-        attributed to the stage that was actually running.
-        """
-
-        logger.info(
-            "Entering recovery state: %s",
-            target_state.value,
-        )
-
-        stage_start = time.monotonic()
-
-        started_at = datetime.datetime.now(
-            datetime.timezone.utc
-        ).isoformat()
-
-        self.current_state = target_state
-
-        try:
-            result = func(*args, **kwargs)
-
-            completed_at = datetime.datetime.now(
-                datetime.timezone.utc
-            ).isoformat()
-
-            duration = round(
-                time.monotonic() - stage_start,
-                2,
-            )
-
-            self.stage_timings[target_state.value] = StageTiming(
-                started_at=started_at,
-                completed_at=completed_at,
-                duration_seconds=duration,
-            )
-
-            self.completed_steps.append(
-                target_state
-            )
-
-            logger.info(
-                "Recovery state completed: %s duration_seconds=%s",
-                target_state.value,
-                duration,
-            )
-
-            return result
-
-        except Exception as exc:
-            logger.critical(
-                "Recovery state failed: %s error=%s",
-                target_state.value,
-                self._sanitize_error(exc),
-            )
-
-            raise RecoveryError(
-                f"Recovery failed at state {target_state.value}."
-            ) from exc
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def execute_failover(
         self,
+        *,
+        manifest_blob: Optional[str] = None,
         emergency_auth_code: Optional[str] = None,
         operator_reason: Optional[str] = None,
-        target_manifest_blob: Optional[str] = None,
     ) -> RecoveryResult:
-        """Execute the complete DR failover state machine."""
+        """
+        Execute the complete DR failover workflow.
 
-        disaster_declared_dt = datetime.datetime.now(
-            datetime.timezone.utc
-        )
+        The method intentionally stops on the first failed stage.
+        """
 
-        self.completed_steps = [
-            RecoveryState.DISASTER_DECLARED
-        ]
-
-        self.current_state = (
-            RecoveryState.DISASTER_DECLARED
-        )
-
-        fencing_res: Optional[FencingResult] = None
-        health_res: Optional[HealthCheckResult] = None
-
-        backup_created_at_dt = disaster_declared_dt
-
-        failed_stage: Optional[RecoveryState] = None
-
-        final_state = RecoveryState.FAILED
-
-        manifest_data: dict = {}
+        recovery_start = time.monotonic()
 
         try:
             self._prepare_work_directory()
 
-            # ---------------------------------------------------------
-            # 1. Production fencing
-            # ---------------------------------------------------------
-            self.current_state = RecoveryState.FENCING_PENDING
-
-            def fencing_step() -> None:
-                nonlocal fencing_res
-
-                fencing_res = self.fencer.evaluate_fencing(
-                    emergency_authorization_code=(
-                        emergency_auth_code
-                    ),
-                    operator_reason=operator_reason,
-                )
-
-                if not fencing_res.is_fenced:
-                    raise SecurityValidationError(
-                        "Production fencing validation failed."
-                    )
+            self._execute_stage(
+                RecoveryState.FENCING_PENDING,
+                self._fence_production,
+                emergency_auth_code,
+                operator_reason,
+            )
 
             self._execute_stage(
                 RecoveryState.PRODUCTION_FENCED,
-                fencing_step,
+                self._verify_fencing,
             )
-
-            # ---------------------------------------------------------
-            # 2. DR preflight
-            # ---------------------------------------------------------
-            def preflight_step() -> None:
-                self._validate_dr_preflight()
 
             self._execute_stage(
                 RecoveryState.DR_PREFLIGHT_PASSED,
-                preflight_step,
+                self._validate_dr_preflight,
             )
-
-            # ---------------------------------------------------------
-            # 3. Acquire and validate manifest
-            # ---------------------------------------------------------
-            local_manifest_path = (
-                self.work_dir / "manifest.json"
-            )
-
-            def manifest_step() -> None:
-                nonlocal manifest_data
-                nonlocal backup_created_at_dt
-
-                blob_name = (
-                    self._resolve_manifest_blob(
-                        target_manifest_blob
-                    )
-                )
-
-                self._download_blob_to_file(
-                    blob_name=blob_name,
-                    target_path=local_manifest_path,
-                    maximum_size_bytes=MAX_MANIFEST_SIZE_BYTES,
-                )
-
-                manifest_data = (
-                    self._load_manifest(
-                        local_manifest_path
-                    )
-                )
-
-                backup_created_at_dt = (
-                    self._validate_manifest(
-                        manifest_data
-                    )
-                )
 
             self._execute_stage(
                 RecoveryState.MANIFEST_VALIDATED,
-                manifest_step,
+                self._acquire_and_validate_manifest,
+                manifest_blob,
             )
-
-            # ---------------------------------------------------------
-            # 4. Download and validate artifacts
-            # ---------------------------------------------------------
-            local_artifacts: Dict[str, Path] = {}
-
-            def artifacts_step() -> None:
-                self._download_and_validate_artifacts(
-                    manifest_data=manifest_data,
-                    local_artifacts=local_artifacts,
-                )
 
             self._execute_stage(
                 RecoveryState.BACKUP_ARTIFACTS_VALIDATED,
-                artifacts_step,
+                self._download_and_validate_artifacts,
             )
-
-            # ---------------------------------------------------------
-            # 5. Stop DR Server
-            # ---------------------------------------------------------
-            def stop_step() -> None:
-                self.tsm.run(
-                    [
-                        "stop",
-                        "--ignore-prompt",
-                    ],
-                    timeout=1800,
-                    check=True,
-                )
 
             self._execute_stage(
                 RecoveryState.DR_STOPPED,
-                stop_step,
+                self._stop_dr,
             )
-
-            # ---------------------------------------------------------
-            # 6. Restore repository
-            # ---------------------------------------------------------
-            def restore_step() -> None:
-                backup_path = local_artifacts.get(
-                    BACKUP_ARTIFACT_KEY
-                )
-
-                if backup_path is None:
-                    raise ValidationError(
-                        "Required backup.tsbak artifact is missing."
-                    )
-
-                self.tsm.run(
-                    [
-                        "maintenance",
-                        "restore",
-                        "--file",
-                        str(backup_path),
-                    ],
-                    timeout=DEFAULT_RECOVERY_TIMEOUT_SECONDS,
-                    check=True,
-                )
 
             self._execute_stage(
                 RecoveryState.REPOSITORY_RESTORED,
-                restore_step,
+                self._restore_repository,
             )
-
-            # ---------------------------------------------------------
-            # 7. Import settings
-            # ---------------------------------------------------------
-            def settings_step() -> None:
-                settings_path = local_artifacts.get(
-                    SETTINGS_ARTIFACT_KEY
-                )
-
-                if settings_path is None:
-                    raise ValidationError(
-                        "Required settings.json artifact is missing."
-                    )
-
-                self.tsm.run(
-                    [
-                        "settings",
-                        "import",
-                        "-f",
-                        str(settings_path),
-                    ],
-                    timeout=1800,
-                    check=True,
-                )
 
             self._execute_stage(
                 RecoveryState.SETTINGS_IMPORTED,
-                settings_step,
+                self._import_settings,
             )
-
-            # ---------------------------------------------------------
-            # 8. Security credential rebinding
-            # ---------------------------------------------------------
-            def security_step() -> None:
-                self._apply_key_vault_security_bindings()
 
             self._execute_stage(
                 RecoveryState.SECURITY_REBOUND,
-                security_step,
+                self._apply_key_vault_security_bindings,
             )
-
-            # ---------------------------------------------------------
-            # 9. Start DR Server
-            # ---------------------------------------------------------
-            def start_step() -> None:
-                self.tsm.run(
-                    ["start"],
-                    timeout=3600,
-                    check=True,
-                )
 
             self._execute_stage(
                 RecoveryState.DR_STARTED,
-                start_step,
+                self._start_dr,
             )
-
-            # ---------------------------------------------------------
-            # 10. Post-restore health validation
-            # ---------------------------------------------------------
-            def health_step() -> None:
-                nonlocal health_res
-
-                dr_hostname = self.config.servers[
-                    "disaster_recovery"
-                ]["hostname"]
-
-                checker = HealthChecker(
-                    tsm_connector=self.tsm,
-                    gateway_hostname=dr_hostname,
-                )
-
-                health_res = checker.run_all_checks()
-
-                if not health_res.overall_healthy:
-                    raise RecoveryError(
-                        "DR health validation failed."
-                    )
 
             self._execute_stage(
                 RecoveryState.HEALTH_VALIDATED,
-                health_step,
+                self._validate_health,
             )
 
-            self.completed_steps.append(
-                RecoveryState.RECOVERY_COMPLETED
-            )
+            self.current_state = RecoveryState.RECOVERY_COMPLETED
+            self.completed_steps.append(self.current_state.value)
 
-            final_state = (
-                RecoveryState.RECOVERY_COMPLETED
-            )
+            self.recovery_completed_at = dt.datetime.now(dt.timezone.utc)
 
-            logger.info(
-                "Tableau DR recovery completed successfully. "
-                "run_id=%s",
-                self.run_id,
+            total_rto = time.monotonic() - recovery_start
+
+            return self._build_result(
+                status="SUCCESS",
+                total_rto_seconds=total_rto,
             )
 
         except Exception as exc:
-            failed_stage = self.current_state
-            final_state = RecoveryState.FAILED
+            self.current_state = RecoveryState.FAILED
+            self.failed_step = self.failed_step or self.current_state.value
 
-            logger.critical(
-                "DR recovery aborted at state=%s error=%s",
-                self.current_state.value,
-                self._sanitize_error(exc),
-            )
-
-            # Deliberately preserve the recovery workspace on failure.
-            # It may contain evidence required for diagnosis.
             self._preserve_failed_recovery_workspace()
 
-        completed_dt = datetime.datetime.now(
-            datetime.timezone.utc
-        )
-
-        rpo_seconds = max(
-            0.0,
-            (
-                disaster_declared_dt
-                - backup_created_at_dt
-            ).total_seconds(),
-        )
-
-        rto_seconds = max(
-            0.0,
-            (
-                completed_dt
-                - disaster_declared_dt
-            ).total_seconds(),
-        )
-
-        return RecoveryResult(
-            run_id=self.run_id,
-            status=(
-                "SUCCESS"
-                if final_state
-                == RecoveryState.RECOVERY_COMPLETED
-                else "FAILED"
-            ),
-            current_state=final_state,
-            completed_steps=self.completed_steps,
-            failed_step=failed_stage,
-            fencing_result=(
-                fencing_res.to_dict()
-                if fencing_res
-                else None
-            ),
-            health_result=(
-                health_res.to_dict()
-                if health_res
-                else None
-            ),
-            disaster_declared_at_utc=(
-                disaster_declared_dt.isoformat()
-            ),
-            recovery_completed_at_utc=(
-                completed_dt.isoformat()
-            ),
-            backup_created_at_utc=(
-                backup_created_at_dt.isoformat()
-            ),
-            measured_backup_age_rpo_seconds=round(
-                rpo_seconds,
-                2,
-            ),
-            total_rto_seconds=round(
-                rto_seconds,
-                2,
-            ),
-            stage_timings={
-                key: asdict(value)
-                for key, value in self.stage_timings.items()
-            },
-        )
-
-    def _prepare_work_directory(self) -> None:
-        """Create a unique recovery workspace without overwriting an existing run."""
-
-        if self.work_dir.exists():
-            raise SecurityValidationError(
-                "Recovery work directory already exists. "
-                "Refusing to reuse an existing recovery workspace."
+            self.logger.error(
+                "DR recovery failed; recovery workspace preserved"
             )
 
-        self.work_dir.mkdir(
+            total_rto = time.monotonic() - recovery_start
+
+            return self._build_result(
+                status="FAILED",
+                total_rto_seconds=total_rto,
+            )
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_run_id(run_id: str) -> str:
+        if not isinstance(run_id, str):
+            raise ValueError("run_id must be a string")
+
+        value = run_id.strip()
+
+        if not value:
+            raise ValueError("run_id cannot be empty")
+
+        if len(value) > 128:
+            raise ValueError("run_id is too long")
+
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+            raise ValueError("run_id contains invalid characters")
+
+        return value
+
+    def _validate_configuration(self) -> None:
+        """
+        Validate critical configuration assumptions before recovery.
+        """
+
+        production = self.config.servers["production"]
+        disaster_recovery = self.config.servers["disaster_recovery"]
+
+        production_hostname = str(
+            production["hostname"]
+        ).strip().lower()
+
+        dr_hostname = str(
+            disaster_recovery["hostname"]
+        ).strip().lower()
+
+        if not production_hostname or not dr_hostname:
+            raise RecoveryError(
+                "Production and DR hostnames are required"
+            )
+
+        if production_hostname == dr_hostname:
+            raise RecoveryError(
+                "Production and DR hostnames must be different"
+            )
+
+        production_identity = production["identity_store"]
+        dr_identity = disaster_recovery["identity_store"]
+
+        validate_identity_store(
+            production_identity,
+            dr_identity,
+        )
+
+        if not self.config.azure["storage_account_name"]:
+            raise RecoveryError(
+                "Azure storage account is not configured"
+            )
+
+        if not self.config.azure["storage_container"]:
+            raise RecoveryError(
+                "Azure storage container is not configured"
+            )
+
+        if not self.config.azure["key_vault_name"]:
+            raise RecoveryError(
+                "Azure Key Vault is not configured"
+            )
+
+    # ------------------------------------------------------------------
+    # State machine
+    # ------------------------------------------------------------------
+
+    def _execute_stage(
+        self,
+        state: RecoveryState,
+        callback: Any,
+        *args: Any,
+    ) -> None:
+        stage_name = state.value
+        self.current_state = state
+        self.failed_step = stage_name
+
+        started = time.monotonic()
+
+        try:
+            callback(*args)
+
+            elapsed = time.monotonic() - started
+            self.stage_timings[stage_name] = round(elapsed, 3)
+
+            self.completed_steps.append(stage_name)
+
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            self.stage_timings[stage_name] = round(elapsed, 3)
+
+            self.logger.error(
+                "Recovery stage failed: %s",
+                stage_name,
+            )
+
+            raise RecoveryError(
+                f"Recovery stage failed: {stage_name}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Stage 1 - Fencing
+    # ------------------------------------------------------------------
+
+    def _fence_production(
+        self,
+        emergency_auth_code: Optional[str],
+        operator_reason: Optional[str],
+    ) -> None:
+        """
+        Production must be fenced before any destructive DR operation.
+        """
+
+        if operator_reason is not None:
+            operator_reason = operator_reason.strip()
+
+            if len(operator_reason) > 1000:
+                raise RecoveryError(
+                    "Operator reason exceeds maximum length"
+                )
+
+        self.fencing_result = self.fencer.fence(
+            emergency_auth_code=emergency_auth_code,
+            operator_reason=operator_reason,
+        )
+
+        if not self.fencing_result.success:
+            raise RecoveryError(
+                "Production fencing was not confirmed"
+            )
+
+    def _verify_fencing(self) -> None:
+        if self.fencing_result is None:
+            raise RecoveryError(
+                "Fencing result is unavailable"
+            )
+
+        if not self.fencing_result.success:
+            raise RecoveryError(
+                "Production fencing failed"
+            )
+
+    # ------------------------------------------------------------------
+    # Stage 2 - DR preflight
+    # ------------------------------------------------------------------
+
+    def _validate_dr_preflight(self) -> None:
+        result = self.tsm.status()
+
+        if not result.success:
+            raise RecoveryError(
+                "Unable to verify DR Tableau Server status"
+            )
+
+        production_hostname = str(
+            self.config.servers["production"]["hostname"]
+        ).strip().lower()
+
+        dr_hostname = str(
+            self.config.servers["disaster_recovery"]["hostname"]
+        ).strip().lower()
+
+        if production_hostname == dr_hostname:
+            raise RecoveryError(
+                "Production and DR hostnames are identical"
+            )
+
+        recovery_root = Path(
+            self.config.paths["recovery_work_dir"]
+        )
+
+        recovery_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        disk = shutil.disk_usage(recovery_root)
+
+        required_gb = float(
+            self.config.backup["minimum_free_space_gb"]
+        )
+
+        required_bytes = int(
+            required_gb * 1024 * 1024 * 1024
+        )
+
+        if disk.free < required_bytes:
+            raise RecoveryError(
+                "Insufficient disk space on DR recovery volume"
+            )
+
+    # ------------------------------------------------------------------
+    # Stage 3 - Work directory
+    # ------------------------------------------------------------------
+
+    def _prepare_work_directory(self) -> None:
+        recovery_root = Path(
+            self.config.paths["recovery_work_dir"]
+        ).resolve()
+
+        recovery_root.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        timestamp = dt.datetime.now(
+            dt.timezone.utc
+        ).strftime("%Y%m%dT%H%M%SZ")
+
+        directory_name = (
+            f"recovery_{timestamp}_{self.run_id}"
+        )
+
+        work_dir = recovery_root / directory_name
+
+        if work_dir.exists():
+            raise RecoveryError(
+                "Recovery workspace already exists"
+            )
+
+        work_dir.mkdir(
             parents=True,
             exist_ok=False,
         )
 
-        minimum_free_space_gb = float(
-            self.config.backup.get(
-                "minimum_free_space_gb",
-                DEFAULT_MIN_FREE_SPACE_GB,
-            )
-        )
+        self.work_dir = work_dir
 
-        validate_disk_space(
-            self.work_dir,
-            required_gb=minimum_free_space_gb,
-        )
+    # ------------------------------------------------------------------
+    # Stage 4 - Manifest
+    # ------------------------------------------------------------------
 
-    def _validate_dr_preflight(self) -> None:
-        """Validate the DR target before destructive restore operations."""
-
-        status_result = self.tsm.status()
-
-        if not status_result.success:
-            raise ValidationError(
-                "Target DR TSM cluster is not responding."
-            )
-
-        dr_hostname = self.config.servers[
-            "disaster_recovery"
-        ]["hostname"]
-
-        production_hostname = self.config.servers[
-            "production"
-        ]["hostname"]
-
-        if (
-            dr_hostname.strip().lower()
-            == production_hostname.strip().lower()
-        ):
-            raise SecurityValidationError(
-                "Production and DR hostnames must never be identical."
-            )
-
-        logger.info(
-            "DR preflight validation passed."
-        )
-
-    def _resolve_manifest_blob(
+    def _acquire_and_validate_manifest(
         self,
-        target_manifest_blob: Optional[str],
-    ) -> str:
-        """Resolve an explicit manifest or discover the newest valid manifest."""
-
-        if target_manifest_blob:
-            return self._validate_blob_reference(
-                target_manifest_blob
-            )
-
-        try:
-            blobs = self.azure.container_client.list_blobs(
-                name_starts_with="backups/"
-            )
-
-            manifest_blobs = sorted(
-                blob.name
-                for blob in blobs
-                if (
-                    isinstance(blob.name, str)
-                    and blob.name.endswith(".json")
-                    and "/manifest_" in blob.name
-                )
-            )
-
-        except AzureError as exc:
-            raise RecoveryError(
-                "Unable to enumerate recovery manifests."
-            ) from exc
-
-        if not manifest_blobs:
-            raise ValidationError(
-                "No valid recovery manifest was found."
-            )
-
-        return self._validate_blob_reference(
-            manifest_blobs[-1]
-        )
-
-    @staticmethod
-    def _validate_blob_reference(
-        blob_name: str,
-    ) -> str:
-        """Validate a remote Blob path before it is used."""
-
-        if (
-            not isinstance(blob_name, str)
-            or not blob_name.strip()
-        ):
-            raise SecurityValidationError(
-                "Manifest Blob path must be a non-empty string."
-            )
-
-        normalized = (
-            blob_name.strip()
-            .replace("\\", "/")
-        )
-
-        if normalized.startswith("/"):
-            raise SecurityValidationError(
-                "Manifest Blob path must not begin with '/'."
-            )
-
-        if "\x00" in normalized:
-            raise SecurityValidationError(
-                "Manifest Blob path contains a null character."
-            )
-
-        if any(
-            part == ".."
-            for part in normalized.split("/")
-        ):
-            raise SecurityValidationError(
-                "Manifest Blob path contains traversal components."
-            )
-
-        if not normalized.startswith("backups/"):
-            raise SecurityValidationError(
-                "Manifest Blob must be located under the backups prefix."
-            )
-
-        if not normalized.endswith(".json"):
-            raise SecurityValidationError(
-                "Recovery manifest must be a JSON Blob."
-            )
-
-        return normalized
-
-    def _download_blob_to_file(
-        self,
-        blob_name: str,
-        target_path: Path,
-        maximum_size_bytes: Optional[int] = None,
+        manifest_blob: Optional[str],
     ) -> None:
-        """Download a Blob to an isolated local file with size enforcement."""
-
-        blob_name = self._validate_blob_reference(
-            blob_name
-        )
-
-        blob_client = (
-            self.azure.container_client.get_blob_client(
-                blob_name
+        if manifest_blob:
+            blob_name = self._validate_blob_reference(
+                manifest_blob
             )
+        else:
+            blob_name = self._resolve_latest_manifest_blob()
+
+        local_manifest = self._download_blob_to_file(
+            blob_name=blob_name,
+            destination=self._require_work_dir() / "manifest.json",
+            maximum_size=self.MAX_MANIFEST_SIZE_BYTES,
         )
 
-        try:
-            properties = blob_client.get_blob_properties()
+        manifest = self._load_manifest(local_manifest)
+
+        self._validate_manifest(manifest)
+
+        self.manifest = manifest
+
+        self._set_backup_timestamp(manifest)
+
+    def _resolve_latest_manifest_blob(self) -> str:
+        """
+        Resolve the newest manifest from the controlled backup prefix.
+
+        The storage container should be RBAC-restricted so that recovery
+        identities cannot arbitrarily modify or delete backup artifacts.
+        """
+
+        blobs = self.azure.list_blobs(
+            prefix="backups/"
+        )
+
+        candidates = []
+
+        for blob in blobs:
+            name = self._extract_blob_name(blob)
+
+            if not name:
+                continue
+
+            normalized = name.replace("\\", "/")
 
             if (
-                maximum_size_bytes is not None
-                and properties.size > maximum_size_bytes
+                normalized.startswith("backups/")
+                and "/manifest_" in normalized
+                and normalized.endswith(".json")
             ):
-                raise SecurityValidationError(
-                    f"Remote artifact '{blob_name}' exceeds the "
-                    "allowed download size."
-                )
+                candidates.append(normalized)
 
-            target_path.parent.mkdir(
-                parents=True,
-                exist_ok=True,
+        if not candidates:
+            raise RecoveryError(
+                "No recovery manifest was found"
             )
 
-            stream = blob_client.download_blob()
+        candidates.sort()
 
-            with target_path.open(
-                "wb"
-            ) as output:
-                for chunk in stream.chunks():
-                    output.write(chunk)
-
-        except (
-            SecurityValidationError,
-            RecoveryError,
-        ):
-            raise
-
-        except AzureError as exc:
-            raise RecoveryError(
-                f"Unable to download recovery artifact '{blob_name}'."
-            ) from exc
-
-        except OSError as exc:
-            raise RecoveryError(
-                "Unable to write downloaded recovery artifact."
-            ) from exc
-
-    @staticmethod
-    def _load_manifest(
-        manifest_path: Path,
-    ) -> dict:
-        """Load and structurally validate the local manifest JSON."""
-
-        validate_file(
-            manifest_path,
-            must_exist=True,
+        return self._validate_blob_reference(
+            candidates[-1]
         )
 
-        try:
-            with manifest_path.open(
-                "r",
-                encoding="utf-8",
-            ) as file:
-                data = json.load(file)
+    @staticmethod
+    def _extract_blob_name(blob: Any) -> Optional[str]:
+        if isinstance(blob, str):
+            return blob
 
-        except json.JSONDecodeError as exc:
-            raise ValidationError(
-                "Recovery manifest contains invalid JSON."
-            ) from exc
+        if isinstance(blob, dict):
+            value = blob.get("name")
 
-        except OSError as exc:
-            raise ValidationError(
-                "Unable to read recovery manifest."
-            ) from exc
+            if isinstance(value, str):
+                return value
 
-        if not isinstance(data, dict):
-            raise ValidationError(
-                "Recovery manifest root must be a JSON object."
+        value = getattr(blob, "name", None)
+
+        if isinstance(value, str):
+            return value
+
+        return None
+
+    def _validate_blob_reference(
+        self,
+        blob_name: str,
+    ) -> str:
+        if not isinstance(blob_name, str):
+            raise RecoveryError(
+                "Blob reference must be a string"
             )
 
-        return data
+        value = blob_name.strip().replace("\\", "/")
+
+        if not value:
+            raise RecoveryError(
+                "Blob reference cannot be empty"
+            )
+
+        if "\x00" in value:
+            raise RecoveryError(
+                "Blob reference contains invalid characters"
+            )
+
+        if value.startswith("/"):
+            raise RecoveryError(
+                "Absolute blob paths are not permitted"
+            )
+
+        if ":" in value:
+            raise RecoveryError(
+                "Drive-qualified blob paths are not permitted"
+            )
+
+        parts = value.split("/")
+
+        if any(
+            part in {"", ".", ".."}
+            for part in parts
+        ):
+            raise RecoveryError(
+                "Invalid blob path"
+            )
+
+        if not value.startswith("backups/"):
+            raise RecoveryError(
+                "Blob must be located under backups/"
+            )
+
+        if not value.endswith(".json") and not value.endswith(".tsbak"):
+            raise RecoveryError(
+                "Unsupported recovery artifact type"
+            )
+
+        if len(value) > 1024:
+            raise RecoveryError(
+                "Blob path is too long"
+            )
+
+        return value
+
+    # ------------------------------------------------------------------
+    # Manifest loading and validation
+    # ------------------------------------------------------------------
+
+    def _load_manifest(
+        self,
+        manifest_path: Path,
+    ) -> Dict[str, Any]:
+        try:
+            raw = manifest_path.read_bytes()
+        except OSError as exc:
+            raise RecoveryError(
+                "Unable to read recovery manifest"
+            ) from exc
+
+        if len(raw) > self.MAX_MANIFEST_SIZE_BYTES:
+            raise RecoveryError(
+                "Recovery manifest exceeds maximum size"
+            )
+
+        try:
+            manifest = json.loads(
+                raw.decode("utf-8")
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RecoveryError(
+                "Recovery manifest is not valid UTF-8 JSON"
+            ) from exc
+
+        if not isinstance(manifest, dict):
+            raise RecoveryError(
+                "Recovery manifest root must be an object"
+            )
+
+        return manifest
 
     def _validate_manifest(
         self,
-        manifest_data: dict,
-    ) -> datetime.datetime:
-        """Validate manifest version, source, timing, and artifact inventory."""
-
-        if (
-            manifest_data.get("manifest_version")
-            != MANIFEST_VERSION
-        ):
-            raise ValidationError(
-                "Unsupported recovery manifest version."
+        manifest: Dict[str, Any],
+    ) -> None:
+        if manifest.get("manifest_version") != self.MANIFEST_VERSION:
+            raise RecoveryError(
+                "Unsupported manifest version"
             )
 
-        if (
-            manifest_data.get("status")
-            != EXPECTED_MANIFEST_STATUS
-        ):
-            raise ValidationError(
-                "Recovery manifest is not in an artifacts-ready state."
+        if manifest.get("status") != self.MANIFEST_STATUS:
+            raise RecoveryError(
+                "Manifest is not marked ARTIFACTS_READY"
             )
 
-        manifest_run_id = manifest_data.get(
-            "run_id"
-        )
+        manifest_run_id = manifest.get("run_id")
 
-        if (
-            not isinstance(manifest_run_id, str)
-            or not manifest_run_id.strip()
-        ):
-            raise ValidationError(
-                "Recovery manifest is missing a valid run_id."
+        if manifest_run_id != self.run_id:
+            raise RecoveryError(
+                "Manifest run_id does not match recovery run_id"
             )
 
-        source = manifest_data.get(
-            "source"
-        )
+        source = manifest.get("source")
 
         if not isinstance(source, dict):
-            raise ValidationError(
-                "Recovery manifest source section is invalid."
+            raise RecoveryError(
+                "Manifest source section is invalid"
             )
 
-        source_version = source.get(
-            "tableau_version"
-        )
+        source_version = source.get("version")
+        source_hostname = source.get("hostname")
+        source_identity_store = source.get("identity_store")
 
-        target_version = self.config.environment[
-            "version"
-        ]
+        if not source_version:
+            raise RecoveryError(
+                "Manifest source version is missing"
+            )
+
+        if not source_hostname:
+            raise RecoveryError(
+                "Manifest source hostname is missing"
+            )
+
+        if not source_identity_store:
+            raise RecoveryError(
+                "Manifest identity store is missing"
+            )
+
+        dr_version = self.config.environment["version"]
 
         validate_tableau_version(
-            backup_version=source_version,
-            dr_version=target_version,
+            source_version,
+            dr_version,
         )
-
-        source_identity_store = source.get(
-            "identity_store"
-        )
-
-        target_identity_store = self.config.servers[
-            "disaster_recovery"
-        ]["identity_store"]
 
         validate_identity_store(
-            source_store=source_identity_store,
-            dr_store=target_identity_store,
+            source_identity_store,
+            self.config.servers[
+                "disaster_recovery"
+            ]["identity_store"],
         )
 
-        production_hostname = self.config.servers[
-            "production"
-        ]["hostname"]
-
-        manifest_hostname = source.get(
-            "hostname"
+        configured_production_hostname = (
+            str(
+                self.config.servers[
+                    "production"
+                ]["hostname"]
+            )
+            .strip()
+            .lower()
         )
 
         if (
-            not isinstance(manifest_hostname, str)
-            or not manifest_hostname.strip()
+            str(source_hostname)
+            .strip()
+            .lower()
+            != configured_production_hostname
         ):
-            raise ValidationError(
-                "Recovery manifest source hostname is invalid."
+            raise RecoveryError(
+                "Manifest source hostname does not match production"
             )
 
-        if (
-            manifest_hostname.strip().lower()
-            != production_hostname.strip().lower()
-        ):
-            raise SecurityValidationError(
-                "Recovery manifest source hostname does not match "
-                "the configured production server."
-            )
-
-        timing = manifest_data.get(
-            "timing"
-        )
+        timing = manifest.get("timing")
 
         if not isinstance(timing, dict):
-            raise ValidationError(
-                "Recovery manifest timing section is invalid."
+            raise RecoveryError(
+                "Manifest timing section is invalid"
             )
 
-        started_at = timing.get(
-            "started_at_utc"
+        backup_created = timing.get(
+            "backup_created_at_utc"
         )
 
-        if (
-            not isinstance(started_at, str)
-            or not started_at.strip()
+        if not isinstance(
+            backup_created,
+            str,
         ):
-            raise ValidationError(
-                "Recovery manifest is missing backup creation time."
+            raise RecoveryError(
+                "Manifest backup timestamp is missing"
             )
 
-        backup_created_at = (
-            self._parse_utc_timestamp(
-                started_at
-            )
+        backup_created_dt = self._parse_utc_timestamp(
+            backup_created
         )
 
-        if backup_created_at > datetime.datetime.now(
-            datetime.timezone.utc
+        now = dt.datetime.now(dt.timezone.utc)
+
+        if backup_created_dt > now + dt.timedelta(
+            minutes=5
         ):
-            raise ValidationError(
-                "Recovery manifest backup timestamp is in the future."
+            raise RecoveryError(
+                "Manifest backup timestamp is in the future"
             )
 
-        artifacts = manifest_data.get(
-            "artifacts"
-        )
+        artifacts = manifest.get("artifacts")
 
         if not isinstance(artifacts, dict):
-            raise ValidationError(
-                "Recovery manifest artifact inventory is invalid."
+            raise RecoveryError(
+                "Manifest artifacts section is invalid"
             )
 
-        required_artifacts = {
-            BACKUP_ARTIFACT_KEY,
-            SETTINGS_ARTIFACT_KEY,
-        }
-
-        missing = required_artifacts - set(
-            artifacts.keys()
+        missing = (
+            self.REQUIRED_ARTIFACTS
+            - set(artifacts.keys())
         )
 
         if missing:
-            raise ValidationError(
-                "Recovery manifest is missing required artifacts: "
-                + ", ".join(sorted(missing))
+            raise RecoveryError(
+                "Required recovery artifacts are missing"
             )
 
-        for key, metadata in artifacts.items():
+        for logical_name in self.REQUIRED_ARTIFACTS:
+            metadata = artifacts.get(logical_name)
+
             self._validate_artifact_metadata(
-                key=key,
-                metadata=metadata,
+                logical_name,
+                metadata,
             )
-
-        logger.info(
-            "Recovery manifest validation passed. "
-            "source_version=%s target_version=%s",
-            source_version,
-            target_version,
-        )
-
-        return backup_created_at
 
     def _validate_artifact_metadata(
         self,
-        key: str,
+        logical_name: str,
         metadata: Any,
     ) -> None:
-        """Validate an individual artifact manifest entry."""
-
         if not isinstance(metadata, dict):
-            raise ValidationError(
-                f"Artifact metadata is invalid for '{key}'."
+            raise RecoveryError(
+                f"Invalid metadata for artifact {logical_name}"
             )
 
-        filename = metadata.get(
-            "filename"
-        )
+        filename = metadata.get("filename")
+        blob_path = metadata.get("blob_path")
+        sha256 = metadata.get("sha256")
+        size_bytes = metadata.get("size_bytes")
 
         if (
             not isinstance(filename, str)
-            or not filename.strip()
-            or len(filename) > MAX_ARTIFACT_FILENAME_LENGTH
+            or not filename
         ):
-            raise SecurityValidationError(
-                f"Invalid artifact filename for '{key}'."
+            raise RecoveryError(
+                f"Missing filename for {logical_name}"
             )
-
-        filename_path = Path(filename)
 
         if (
-            filename_path.name != filename
-            or filename in {".", ".."}
-            or "/" in filename
-            or "\\" in filename
-            or "\x00" in filename
+            Path(filename).name != filename
+            or not self.SAFE_NAME_PATTERN.fullmatch(
+                filename
+            )
         ):
-            raise SecurityValidationError(
-                f"Unsafe artifact filename for '{key}'."
+            raise RecoveryError(
+                f"Unsafe filename for {logical_name}"
             )
 
-        blob_path = metadata.get(
-            "blob_path"
-        )
+        if filename != logical_name:
+            raise RecoveryError(
+                f"Unexpected filename for {logical_name}"
+            )
 
-        normalized_blob_path = (
-            self.azure._validate_blob_path(
+        if not isinstance(blob_path, str):
+            raise RecoveryError(
+                f"Missing blob path for {logical_name}"
+            )
+
+        validated_blob_path = (
+            self._validate_blob_reference(
                 blob_path
             )
         )
 
-        if not normalized_blob_path.startswith(
-            "backups/"
+        if not (
+            validated_blob_path.endswith(
+                f"/{logical_name}"
+            )
+            or validated_blob_path.endswith(
+                logical_name
+            )
         ):
-            raise SecurityValidationError(
-                f"Artifact '{key}' is outside the backup prefix."
+            raise RecoveryError(
+                f"Artifact blob path does not match logical name: {logical_name}"
             )
 
-        sha256 = metadata.get(
-            "sha256"
-        )
-
-        self.azure._validate_sha256(
-            sha256
-        )
-
-        size_bytes = metadata.get(
-            "size_bytes"
-        )
+        self._validate_sha256(sha256)
 
         if (
             isinstance(size_bytes, bool)
             or not isinstance(size_bytes, int)
-            or size_bytes <= 0
         ):
-            raise ValidationError(
-                f"Invalid artifact size for '{key}'."
+            raise RecoveryError(
+                f"Invalid size for {logical_name}"
             )
 
-        logical_name = metadata.get(
-            "logical_name"
+        if size_bytes <= 0:
+            raise RecoveryError(
+                f"Artifact size must be positive: {logical_name}"
+            )
+
+        if size_bytes > self.MAX_ARTIFACT_SIZE_BYTES:
+            raise RecoveryError(
+                f"Artifact exceeds maximum allowed size: {logical_name}"
+            )
+
+    @classmethod
+    def _validate_sha256(
+        cls,
+        value: Any,
+    ) -> str:
+        if not isinstance(value, str):
+            raise RecoveryError(
+                "SHA-256 value must be a string"
+            )
+
+        value = value.strip().lower()
+
+        if not cls.SHA256_PATTERN.fullmatch(value):
+            raise RecoveryError(
+                "Invalid SHA-256 value"
+            )
+
+        return value
+
+    @staticmethod
+    def _parse_utc_timestamp(
+        value: str,
+    ) -> dt.datetime:
+        try:
+            parsed = dt.datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise RecoveryError(
+                "Invalid UTC timestamp"
+            ) from exc
+
+        if parsed.tzinfo is None:
+            raise RecoveryError(
+                "Timestamp must contain timezone information"
+            )
+
+        return parsed.astimezone(
+            dt.timezone.utc
+        )
+
+    def _set_backup_timestamp(
+        self,
+        manifest: Dict[str, Any],
+    ) -> None:
+        timing = manifest.get("timing", {})
+
+        timestamp = timing.get(
+            "backup_created_at_utc"
+        )
+
+        if isinstance(timestamp, str):
+            self.backup_created_at = (
+                self._parse_utc_timestamp(
+                    timestamp
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # Secure blob download
+    # ------------------------------------------------------------------
+
+    def _download_blob_to_file(
+        self,
+        *,
+        blob_name: str,
+        destination: Path,
+        maximum_size: int,
+        expected_size: Optional[int] = None,
+    ) -> Path:
+        blob_name = self._validate_blob_reference(
+            blob_name
+        )
+
+        if maximum_size <= 0:
+            raise RecoveryError(
+                "Invalid maximum download size"
+            )
+
+        destination = destination.resolve()
+
+        work_dir = self._require_work_dir().resolve()
+
+        try:
+            destination.relative_to(work_dir)
+        except ValueError as exc:
+            raise RecoveryError(
+                "Download destination escapes recovery workspace"
+            ) from exc
+
+        if destination.exists():
+            raise RecoveryError(
+                "Refusing to overwrite existing recovery artifact"
+            )
+
+        destination.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        try:
+            properties = (
+                self.azure.get_blob_properties(
+                    blob_name
+                )
+            )
+        except AzureError as exc:
+            raise RecoveryError(
+                "Unable to retrieve recovery artifact properties"
+            ) from exc
+
+        remote_size = getattr(
+            properties,
+            "size",
+            None,
         )
 
         if (
-            not isinstance(logical_name, str)
-            or not logical_name.strip()
+            isinstance(remote_size, int)
+            and remote_size > maximum_size
         ):
-            raise ValidationError(
-                f"Invalid logical artifact name for '{key}'."
+            raise RecoveryError(
+                "Remote recovery artifact exceeds allowed size"
             )
 
-    def _download_and_validate_artifacts(
-        self,
-        manifest_data: dict,
-        local_artifacts: Dict[str, Path],
-    ) -> None:
-        """Download all manifest artifacts and verify size plus SHA-256."""
+        if (
+            expected_size is not None
+            and isinstance(remote_size, int)
+            and remote_size != expected_size
+        ):
+            raise RecoveryError(
+                "Remote recovery artifact size does not match manifest"
+            )
 
-        artifacts = manifest_data[
+        total_bytes = 0
+
+        try:
+            stream = self.azure.download_blob_stream(
+                blob_name
+            )
+
+            with destination.open(
+                "xb"
+            ) as output:
+                for chunk in stream.chunks():
+                    if not chunk:
+                        continue
+
+                    total_bytes += len(chunk)
+
+                    # HARD streaming limit.
+                    # Do not trust Content-Length or manifest size.
+                    if total_bytes > maximum_size:
+                        raise RecoveryError(
+                            "Recovery artifact exceeded streaming size limit"
+                        )
+
+                    if (
+                        expected_size is not None
+                        and total_bytes > expected_size
+                    ):
+                        raise RecoveryError(
+                            "Downloaded artifact exceeded manifest size"
+                        )
+
+                    output.write(chunk)
+
+        except RecoveryError:
+            self._safe_delete_file(destination)
+            raise
+
+        except (OSError, AzureError) as exc:
+            self._safe_delete_file(destination)
+
+            raise RecoveryError(
+                "Unable to download recovery artifact"
+            ) from exc
+
+        if expected_size is not None:
+            if total_bytes != expected_size:
+                self._safe_delete_file(destination)
+
+                raise RecoveryError(
+                    "Downloaded artifact size does not match manifest"
+                )
+
+        return destination
+
+    # ------------------------------------------------------------------
+    # Artifact restore preparation
+    # ------------------------------------------------------------------
+
+    def _download_and_validate_artifacts(self) -> None:
+        if self.manifest is None:
+            raise RecoveryError(
+                "Manifest has not been loaded"
+            )
+
+        artifacts = self.manifest.get(
             "artifacts"
-        ]
+        )
 
-        for key, metadata in artifacts.items():
-            filename = metadata["filename"]
+        if not isinstance(artifacts, dict):
+            raise RecoveryError(
+                "Manifest artifacts are invalid"
+            )
 
-            local_target = (
-                self.work_dir / filename
+        work_dir = self._require_work_dir()
+
+        for logical_name in (
+            "backup.tsbak",
+            "settings.json",
+        ):
+            metadata = artifacts.get(
+                logical_name
+            )
+
+            if not isinstance(metadata, dict):
+                raise RecoveryError(
+                    f"Missing artifact metadata: {logical_name}"
+                )
+
+            blob_path = self._validate_blob_reference(
+                metadata["blob_path"]
+            )
+
+            expected_sha256 = self._validate_sha256(
+                metadata["sha256"]
+            )
+
+            expected_size = metadata["size_bytes"]
+
+            if (
+                isinstance(expected_size, bool)
+                or not isinstance(expected_size, int)
+                or expected_size <= 0
+            ):
+                raise RecoveryError(
+                    f"Invalid expected size: {logical_name}"
+                )
+
+            destination = (
+                work_dir / logical_name
+            )
+
+            local_file = (
+                self._download_blob_to_file(
+                    blob_name=blob_path,
+                    destination=destination,
+                    maximum_size=self.MAX_ARTIFACT_SIZE_BYTES,
+                    expected_size=expected_size,
+                )
             )
 
             self._validate_local_target(
-                local_target
+                local_file
             )
 
-            blob_path = (
-                self.azure._validate_blob_path(
-                    metadata["blob_path"]
-                )
-            )
-
-            expected_size = metadata[
-                "size_bytes"
-            ]
-
-            expected_sha256 = (
-                self.azure._validate_sha256(
-                    metadata["sha256"]
-                )
-            )
-
-            logger.info(
-                "Downloading recovery artifact '%s'.",
-                filename,
-            )
-
-            self._download_blob_to_file(
-                blob_name=blob_path,
-                target_path=local_target,
-                maximum_size_bytes=(
-                    expected_size
-                    if expected_size > 0
-                    else None
-                ),
-            )
-
-            validate_file(
-                local_target,
-                must_exist=True,
-            )
-
-            actual_size = local_target.stat().st_size
+            actual_size = local_file.stat().st_size
 
             if actual_size != expected_size:
-                raise IntegrityError(
-                    f"Downloaded artifact size mismatch for '{key}'."
+                self._safe_delete_file(
+                    local_file
                 )
 
-            actual_sha256 = sha256_file(
-                local_target
+                raise RecoveryError(
+                    f"Local artifact size mismatch: {logical_name}"
+                )
+
+            actual_sha256 = (
+                sha256_file(
+                    local_file
+                )
             )
 
             if not self._constant_time_equal(
                 actual_sha256,
                 expected_sha256,
             ):
-                raise IntegrityError(
-                    f"Downloaded artifact SHA-256 mismatch for '{key}'."
+                self._safe_delete_file(
+                    local_file
                 )
 
-            # Verify the remote object's metadata/content again.
-            # This catches a mismatch between the manifest and the
-            # currently stored remote object before restoration.
-            self.azure.verify_remote_blob(
-                blob_path=blob_path,
-                expected_size_bytes=expected_size,
+                raise RecoveryError(
+                    f"SHA-256 validation failed: {logical_name}"
+                )
+
+            # Verify the remote object again after local
+            # download. This protects against a mismatch between
+            # the object initially inspected and the object read.
+            if not self.azure.verify_remote_blob(
+                blob_path,
+                expected_size=expected_size,
                 expected_sha256=expected_sha256,
                 verify_content_stream=bool(
-                    self.config.backup.get(
-                        "verify_remote_content_sha256",
-                        False,
-                    )
+                    self.config.backup[
+                        "verify_remote_content_sha256"
+                    ]
                 ),
-            )
-
-            local_artifacts[key] = local_target
-
-        logger.info(
-            "All recovery artifacts passed integrity validation."
-        )
+            ):
+                raise RecoveryError(
+                    f"Remote artifact verification failed: {logical_name}"
+                )
 
     def _validate_local_target(
         self,
         target: Path,
     ) -> None:
-        """Ensure a downloaded artifact remains inside the recovery workspace."""
+        work_dir = self._require_work_dir().resolve()
+        target = target.resolve()
 
         try:
-            target.parent.resolve().relative_to(
-                self.work_dir.resolve()
-            )
+            target.relative_to(work_dir)
         except ValueError as exc:
-            raise SecurityValidationError(
-                "Recovery artifact path escapes the isolated work directory."
+            raise RecoveryError(
+                "Recovery artifact escapes isolated workspace"
             ) from exc
 
-        if target.exists():
-            raise SecurityValidationError(
-                f"Recovery artifact already exists: {target.name}"
+        if target == work_dir:
+            raise RecoveryError(
+                "Recovery artifact cannot equal workspace root"
             )
 
-    def _apply_key_vault_security_bindings(
-        self,
-    ) -> None:
-        """
-        Retrieve DR security material from Azure Key Vault and apply it via TSM.
-
-        Secret values are never logged. Temporary credential files are removed
-        automatically when the context exits.
-        """
-
-        key_vault_name = self.config.azure[
-            "key_vault_name"
-        ]
-
-        if (
-            not isinstance(key_vault_name, str)
-            or not key_vault_name.strip()
-        ):
-            raise SecurityValidationError(
-                "Azure Key Vault name is not configured."
+        if target.exists() and not target.is_file():
+            raise RecoveryError(
+                "Recovery artifact target is not a regular file"
             )
 
-        key_vault_uri = (
-            f"https://{key_vault_name.strip()}"
-            ".vault.azure.net"
+    # ------------------------------------------------------------------
+    # Stage 5 - Stop DR
+    # ------------------------------------------------------------------
+
+    def _stop_dr(self) -> None:
+        result = self.tsm.run(
+            [
+                "stop",
+            ]
         )
 
+        if not result.success:
+            raise RecoveryError(
+                "Unable to stop DR Tableau Server"
+            )
+
+    # ------------------------------------------------------------------
+    # Stage 6 - Restore repository
+    # ------------------------------------------------------------------
+
+    def _restore_repository(self) -> None:
+        backup_file = (
+            self._require_work_dir()
+            / "backup.tsbak"
+        )
+
+        self._validate_local_target(
+            backup_file
+        )
+
+        if not backup_file.is_file():
+            raise RecoveryError(
+                "Validated backup artifact is missing"
+            )
+
+        result = self.tsm.run(
+            [
+                "maintenance",
+                "restore",
+                "--file",
+                str(backup_file),
+            ]
+        )
+
+        if not result.success:
+            raise RecoveryError(
+                "Tableau repository restore failed"
+            )
+
+    # ------------------------------------------------------------------
+    # Stage 7 - Settings import
+    # ------------------------------------------------------------------
+
+    def _import_settings(self) -> None:
+        settings_file = (
+            self._require_work_dir()
+            / "settings.json"
+        )
+
+        self._validate_local_target(
+            settings_file
+        )
+
+        if not settings_file.is_file():
+            raise RecoveryError(
+                "Validated settings artifact is missing"
+            )
+
+        result = self.tsm.run(
+            [
+                "settings",
+                "import",
+                "-f",
+                str(settings_file),
+            ]
+        )
+
+        if not result.success:
+            raise RecoveryError(
+                "Tableau settings import failed"
+            )
+
+    # ------------------------------------------------------------------
+    # Stage 8 - Security rebound
+    # ------------------------------------------------------------------
+
+    def _apply_key_vault_security_bindings(self) -> None:
+        key_vault_name = str(
+            self.config.azure[
+                "key_vault_name"
+            ]
+        ).strip()
+
+        if not key_vault_name:
+            raise RecoveryError(
+                "Key Vault name is not configured"
+            )
+
+        vault_url = (
+            f"https://{key_vault_name}.vault.azure.net/"
+        )
+
+        credential = DefaultAzureCredential(
+            exclude_interactive_browser_credential=True
+        )
+
+        client = SecretClient(
+            vault_url=vault_url,
+            credential=credential,
+        )
+
+        cert_secret_name = (
+            "tableau-dr-ssl-cert"
+        )
+
+        key_secret_name = (
+            "tableau-dr-ssl-key"
+        )
+
+        cert_path: Optional[Path] = None
+        key_path: Optional[Path] = None
+
         try:
-            credential = DefaultAzureCredential()
-
-            secret_client = SecretClient(
-                vault_url=key_vault_uri,
-                credential=credential,
+            cert_secret = client.get_secret(
+                cert_secret_name
             )
 
-            ssl_cert_secret = (
-                secret_client.get_secret(
-                    "tableau-dr-ssl-cert"
+            key_secret = client.get_secret(
+                key_secret_name
+            )
+
+            cert_value = cert_secret.value
+            key_value = key_secret.value
+
+            if not cert_value or not key_value:
+                raise RecoveryError(
+                    "Required SSL secrets are empty"
                 )
+
+            security_dir = (
+                self._require_work_dir()
+                / "security"
             )
 
-            ssl_key_secret = (
-                secret_client.get_secret(
-                    "tableau-dr-ssl-key"
-                )
+            security_dir.mkdir(
+                mode=0o700,
+                parents=True,
+                exist_ok=False,
             )
+
+            cert_path = (
+                security_dir / "server.crt"
+            )
+
+            key_path = (
+                security_dir / "server.key"
+            )
+
+            self._write_secret_file(
+                cert_path,
+                cert_value,
+            )
+
+            self._write_secret_file(
+                key_path,
+                key_value,
+            )
+
+            result = self.tsm.run(
+                [
+                    "security",
+                    "external-ssl",
+                    "enable",
+                    "--cert-file",
+                    str(cert_path),
+                    "--key-file",
+                    str(key_path),
+                ]
+            )
+
+            if not result.success:
+                raise RecoveryError(
+                    "Unable to configure external SSL"
+                )
+
+            pending_result = self.tsm.run(
+                [
+                    "pending-changes",
+                    "apply",
+                    "--ignore-prompt",
+                ]
+            )
+
+            if not pending_result.success:
+                raise RecoveryError(
+                    "Unable to apply Tableau pending security changes"
+                )
 
         except AzureError as exc:
-            raise SecurityValidationError(
-                "Unable to retrieve DR security material from Key Vault."
+            raise RecoveryError(
+                "Unable to retrieve required security material from Key Vault"
             ) from exc
 
-        if (
-            not ssl_cert_secret.value
-            or not ssl_key_secret.value
-        ):
-            raise SecurityValidationError(
-                "Required DR SSL security material is missing."
-            )
+        finally:
+            self._safe_delete_file(cert_path)
+            self._safe_delete_file(key_path)
 
-        with tempfile.TemporaryDirectory(
-            prefix="tableau_dr_security_"
-        ) as temp_dir:
-            temp_path = Path(temp_dir)
-
-            cert_file = (
-                temp_path / "ssl_cert.crt"
-            )
-
-            key_file = (
-                temp_path / "ssl_key.key"
-            )
-
-            try:
-                cert_file.write_text(
-                    ssl_cert_secret.value,
-                    encoding="utf-8",
-                    newline="\n",
+            if cert_path is not None:
+                self._safe_delete_directory(
+                    cert_path.parent
                 )
-
-                key_file.write_text(
-                    ssl_key_secret.value,
-                    encoding="utf-8",
-                    newline="\n",
-                )
-
-                if os.name != "nt":
-                    os.chmod(
-                        cert_file,
-                        0o600,
-                    )
-                    os.chmod(
-                        key_file,
-                        0o600,
-                    )
-
-                logger.info(
-                    "Applying DR external SSL configuration via TSM."
-                )
-
-                self.tsm.run(
-                    [
-                        "security",
-                        "external-ssl",
-                        "enable",
-                        "--cert-file",
-                        str(cert_file),
-                        "--key-file",
-                        str(key_file),
-                    ],
-                    timeout=1800,
-                    check=True,
-                )
-
-                self.tsm.run(
-                    [
-                        "pending-changes",
-                        "apply",
-                    ],
-                    timeout=1800,
-                    check=True,
-                )
-
-            except OSError as exc:
-                raise SecurityValidationError(
-                    "Unable to create temporary DR security files."
-                ) from exc
 
     @staticmethod
-    def _parse_utc_timestamp(
-        timestamp: str,
-    ) -> datetime.datetime:
-        """Parse an ISO-8601 timestamp and require timezone awareness."""
-
-        normalized = timestamp.strip()
-
-        if normalized.endswith("Z"):
-            normalized = (
-                normalized[:-1]
-                + "+00:00"
+    def _write_secret_file(
+        path: Path,
+        value: str,
+    ) -> None:
+        if not isinstance(value, str) or not value:
+            raise RecoveryError(
+                "Secret value is invalid"
             )
+
+        path.write_text(
+            value,
+            encoding="utf-8",
+        )
+
+        if os.name != "nt":
+            try:
+                path.chmod(0o600)
+            except OSError as exc:
+                raise RecoveryError(
+                    "Unable to secure temporary secret file"
+                ) from exc
+
+    # ------------------------------------------------------------------
+    # Stage 9 - Start DR
+    # ------------------------------------------------------------------
+
+    def _start_dr(self) -> None:
+        result = self.tsm.run(
+            [
+                "start",
+            ]
+        )
+
+        if not result.success:
+            raise RecoveryError(
+                "Unable to start DR Tableau Server"
+            )
+
+    # ------------------------------------------------------------------
+    # Stage 10 - Health validation
+    # ------------------------------------------------------------------
+
+    def _validate_health(self) -> None:
+        self.health_result = (
+            self.health_checker.check()
+        )
+
+        if not self.health_result.healthy:
+            raise RecoveryError(
+                "DR health validation failed"
+            )
+
+    # ------------------------------------------------------------------
+    # Result / metrics
+    # ------------------------------------------------------------------
+
+    def _build_result(
+        self,
+        *,
+        status: str,
+        total_rto_seconds: float,
+    ) -> RecoveryResult:
+        backup_age: Optional[float] = None
+
+        if self.backup_created_at is not None:
+            backup_age = (
+                self.disaster_declared_at
+                - self.backup_created_at
+            ).total_seconds()
+
+            if backup_age < 0:
+                backup_age = 0.0
+
+        fencing_dict: Optional[Dict[str, Any]] = None
+
+        if self.fencing_result is not None:
+            fencing_dict = asdict(
+                self.fencing_result
+            )
+
+        health_dict: Optional[Dict[str, Any]] = None
+
+        if self.health_result is not None:
+            health_dict = asdict(
+                self.health_result
+            )
+
+        return RecoveryResult(
+            run_id=self.run_id,
+            status=status,
+            current_state=self.current_state.value,
+            completed_steps=list(
+                self.completed_steps
+            ),
+            failed_step=self.failed_step
+            if status == "FAILED"
+            else None,
+            fencing_result=fencing_dict,
+            health_result=health_dict,
+            disaster_declared_at_utc=(
+                self.disaster_declared_at
+                .isoformat()
+            ),
+            recovery_completed_at_utc=(
+                self.recovery_completed_at.isoformat()
+                if self.recovery_completed_at
+                else None
+            ),
+            backup_created_at_utc=(
+                self.backup_created_at.isoformat()
+                if self.backup_created_at
+                else None
+            ),
+            measured_backup_age_rpo_seconds=backup_age,
+            total_rto_seconds=round(
+                total_rto_seconds,
+                3,
+            ),
+            stage_timings=dict(
+                self.stage_timings
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Workspace / cleanup
+    # ------------------------------------------------------------------
+
+    def _require_work_dir(self) -> Path:
+        if self.work_dir is None:
+            raise RecoveryError(
+                "Recovery workspace has not been initialized"
+            )
+
+        return self.work_dir
+
+    def _preserve_failed_recovery_workspace(self) -> None:
+        """
+        Failed recovery artifacts are deliberately preserved.
+
+        They may be required for incident investigation.
+        """
+
+        if self.work_dir is None:
+            return
 
         try:
-            parsed = datetime.datetime.fromisoformat(
-                normalized
-            )
-        except ValueError as exc:
-            raise ValidationError(
-                "Invalid UTC timestamp in recovery manifest."
-            ) from exc
-
-        if parsed.tzinfo is None:
-            raise ValidationError(
-                "Recovery manifest timestamp must contain timezone information."
+            marker = (
+                self.work_dir
+                / "RECOVERY_FAILED"
             )
 
-        return parsed.astimezone(
-            datetime.timezone.utc
-        )
+            marker.write_text(
+                (
+                    "Recovery failed.\n"
+                    "Workspace intentionally preserved "
+                    "for incident investigation.\n"
+                ),
+                encoding="utf-8",
+            )
+
+        except OSError:
+            self.logger.warning(
+                "Unable to create recovery failure marker"
+            )
+
+    @staticmethod
+    def _safe_delete_file(
+        path: Optional[Path],
+    ) -> None:
+        if path is None:
+            return
+
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            # Never mask the original recovery failure.
+            pass
+
+    @staticmethod
+    def _safe_delete_directory(
+        path: Path,
+    ) -> None:
+        try:
+            if path.exists():
+                path.rmdir()
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # Constant-time comparison
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _constant_time_equal(
-        actual: str,
-        expected: str,
+        left: str,
+        right: str,
     ) -> bool:
-        """Perform constant-time string comparison for integrity values."""
-
-        import hmac
+        try:
+            left_bytes = bytes.fromhex(
+                left
+            )
+            right_bytes = bytes.fromhex(
+                right
+            )
+        except ValueError:
+            return False
 
         return hmac.compare_digest(
-            actual.lower(),
-            expected.lower(),
+            left_bytes,
+            right_bytes,
         )
-
-    def _preserve_failed_recovery_workspace(
-        self,
-    ) -> None:
-        """Log that failed recovery evidence is intentionally preserved."""
-
-        if self.work_dir.exists():
-            logger.warning(
-                "Recovery workspace preserved for diagnosis: %s",
-                self.work_dir.name,
-            )
-
-    @staticmethod
-    def _sanitize_error(
-        error: object,
-    ) -> str:
-        """Return a safe error representation without common secret material."""
-
-        text = str(error)
-
-        sensitive_terms = (
-            "password",
-            "passwd",
-            "passphrase",
-            "secret",
-            "token",
-            "access_token",
-            "client_secret",
-            "sas",
-            "private_key",
-        )
-
-        if any(
-            term in text.lower()
-            for term in sensitive_terms
-        ):
-            return "[REDACTED_ERROR]"
-
-        return text[:1000]
