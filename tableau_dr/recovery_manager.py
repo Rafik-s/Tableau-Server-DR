@@ -4,6 +4,7 @@ Enterprise Tableau Server Disaster Recovery recovery orchestrator.
 The recovery workflow is intentionally fail-closed:
 
     DISASTER_DECLARED
+        -> FENCING_PENDING
         -> PRODUCTION_FENCED
         -> DR_PREFLIGHT_PASSED
         -> MANIFEST_VALIDATED
@@ -24,26 +25,24 @@ Security principles:
 - Never continue after a fencing failure.
 - Never expose Key Vault secrets in logs.
 - Never reuse a recovery workspace.
-- Never report a successful recovery unless health validation succeeds.
+- Never report successful recovery unless health validation succeeds.
+- Recovery run IDs and backup run IDs are independent identifiers.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import enum
-import hashlib
 import hmac
 import json
 import logging
 import os
 import re
 import shutil
-import tempfile
 import time
-import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from azure.core.exceptions import AzureError
 from azure.identity import DefaultAzureCredential
@@ -104,9 +103,7 @@ class RecoveryResult:
 
 
 class RecoveryManager:
-    """
-    High-level fail-closed Tableau Server disaster recovery orchestrator.
-    """
+    """High-level fail-closed Tableau Server DR recovery orchestrator."""
 
     MANIFEST_VERSION = "2.0"
     MANIFEST_STATUS = "ARTIFACTS_READY"
@@ -118,10 +115,18 @@ class RecoveryManager:
 
     MAX_MANIFEST_SIZE_BYTES = 10 * 1024 * 1024
     MAX_ARTIFACT_SIZE_BYTES = 1024 * 1024 * 1024 * 1024
-    DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 
-    SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
-    SHA256_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
+    SAFE_NAME_PATTERN = re.compile(
+        r"^[A-Za-z0-9_.-]+$"
+    )
+
+    SHA256_PATTERN = re.compile(
+        r"^[a-fA-F0-9]{64}$"
+    )
+
+    RUN_ID_PATTERN = re.compile(
+        r"^[A-Za-z0-9_.-]+$"
+    )
 
     def __init__(
         self,
@@ -139,8 +144,10 @@ class RecoveryManager:
         )
 
         self.azure = AzureManager(
-            config=config,
-            logger=self.logger,
+            account_name=config.azure["storage_account_name"],
+            container_name=config.azure["storage_container"],
+            max_retries=config.azure["max_retries"],
+            backoff_factor=config.azure["retry_backoff_factor"],
         )
 
         self.fencer = ProductionFencer(
@@ -154,19 +161,20 @@ class RecoveryManager:
         )
 
         self.current_state = RecoveryState.DISASTER_DECLARED
-        self.completed_steps: List[str] = []
+        self.completed_steps: List[str] = [
+            RecoveryState.DISASTER_DECLARED.value
+        ]
         self.stage_timings: Dict[str, float] = {}
 
         self.failed_step: Optional[str] = None
         self.fencing_result: Optional[FencingResult] = None
         self.health_result: Optional[HealthCheckResult] = None
 
-        self.disaster_declared_at = dt.datetime.now(dt.timezone.utc)
-        self.recovery_completed_at: Optional[dt.datetime] = None
+        self.disaster_declared_at = dt.datetime.now(
+            dt.timezone.utc
+        )
 
-        # IMPORTANT:
-        # Do not initialize this to disaster_declared_at.
-        # If the backup timestamp cannot be established, RPO is unknown.
+        self.recovery_completed_at: Optional[dt.datetime] = None
         self.backup_created_at: Optional[dt.datetime] = None
 
         self.work_dir: Optional[Path] = None
@@ -188,7 +196,7 @@ class RecoveryManager:
         """
         Execute the complete DR failover workflow.
 
-        The method intentionally stops on the first failed stage.
+        Recovery stops immediately after the first failed stage.
         """
 
         recovery_start = time.monotonic()
@@ -255,28 +263,44 @@ class RecoveryManager:
             )
 
             self.current_state = RecoveryState.RECOVERY_COMPLETED
-            self.completed_steps.append(self.current_state.value)
+            self.completed_steps.append(
+                self.current_state.value
+            )
 
-            self.recovery_completed_at = dt.datetime.now(dt.timezone.utc)
+            self.recovery_completed_at = (
+                dt.datetime.now(dt.timezone.utc)
+            )
 
-            total_rto = time.monotonic() - recovery_start
+            total_rto = (
+                time.monotonic() - recovery_start
+            )
 
             return self._build_result(
                 status="SUCCESS",
                 total_rto_seconds=total_rto,
             )
 
-        except Exception as exc:
+        except Exception:
+            failed_stage = self.failed_step
+
             self.current_state = RecoveryState.FAILED
-            self.failed_step = self.failed_step or self.current_state.value
+
+            if failed_stage is None:
+                failed_stage = "RECOVERY_INITIALIZATION"
+
+            self.failed_step = failed_stage
 
             self._preserve_failed_recovery_workspace()
 
             self.logger.error(
-                "DR recovery failed; recovery workspace preserved"
+                "DR recovery failed at stage '%s'; "
+                "recovery workspace preserved",
+                failed_stage,
             )
 
-            total_rto = time.monotonic() - recovery_start
+            total_rto = (
+                time.monotonic() - recovery_start
+            )
 
             return self._build_result(
                 status="FAILED",
@@ -287,31 +311,44 @@ class RecoveryManager:
     # Validation
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _validate_run_id(run_id: str) -> str:
+    @classmethod
+    def _validate_run_id(
+        cls,
+        run_id: str,
+    ) -> str:
+        """Validate a recovery or backup run identifier."""
+
         if not isinstance(run_id, str):
-            raise ValueError("run_id must be a string")
+            raise ValueError(
+                "run_id must be a string"
+            )
 
         value = run_id.strip()
 
         if not value:
-            raise ValueError("run_id cannot be empty")
+            raise ValueError(
+                "run_id cannot be empty"
+            )
 
         if len(value) > 128:
-            raise ValueError("run_id is too long")
+            raise ValueError(
+                "run_id is too long"
+            )
 
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
-            raise ValueError("run_id contains invalid characters")
+        if not cls.RUN_ID_PATTERN.fullmatch(value):
+            raise ValueError(
+                "run_id contains invalid characters"
+            )
 
         return value
 
     def _validate_configuration(self) -> None:
-        """
-        Validate critical configuration assumptions before recovery.
-        """
+        """Validate critical recovery configuration."""
 
         production = self.config.servers["production"]
-        disaster_recovery = self.config.servers["disaster_recovery"]
+        disaster_recovery = (
+            self.config.servers["disaster_recovery"]
+        )
 
         production_hostname = str(
             production["hostname"]
@@ -331,25 +368,28 @@ class RecoveryManager:
                 "Production and DR hostnames must be different"
             )
 
-        production_identity = production["identity_store"]
-        dr_identity = disaster_recovery["identity_store"]
-
         validate_identity_store(
-            production_identity,
-            dr_identity,
+            production["identity_store"],
+            disaster_recovery["identity_store"],
         )
 
-        if not self.config.azure["storage_account_name"]:
+        if not str(
+            self.config.azure["storage_account_name"]
+        ).strip():
             raise RecoveryError(
                 "Azure storage account is not configured"
             )
 
-        if not self.config.azure["storage_container"]:
+        if not str(
+            self.config.azure["storage_container"]
+        ).strip():
             raise RecoveryError(
                 "Azure storage container is not configured"
             )
 
-        if not self.config.azure["key_vault_name"]:
+        if not str(
+            self.config.azure["key_vault_name"]
+        ).strip():
             raise RecoveryError(
                 "Azure Key Vault is not configured"
             )
@@ -364,7 +404,10 @@ class RecoveryManager:
         callback: Any,
         *args: Any,
     ) -> None:
+        """Execute one recovery stage and record its timing."""
+
         stage_name = state.value
+
         self.current_state = state
         self.failed_step = stage_name
 
@@ -374,13 +417,23 @@ class RecoveryManager:
             callback(*args)
 
             elapsed = time.monotonic() - started
-            self.stage_timings[stage_name] = round(elapsed, 3)
 
-            self.completed_steps.append(stage_name)
+            self.stage_timings[stage_name] = round(
+                elapsed,
+                3,
+            )
+
+            self.completed_steps.append(
+                stage_name
+            )
 
         except Exception as exc:
             elapsed = time.monotonic() - started
-            self.stage_timings[stage_name] = round(elapsed, 3)
+
+            self.stage_timings[stage_name] = round(
+                elapsed,
+                3,
+            )
 
             self.logger.error(
                 "Recovery stage failed: %s",
@@ -400,9 +453,7 @@ class RecoveryManager:
         emergency_auth_code: Optional[str],
         operator_reason: Optional[str],
     ) -> None:
-        """
-        Production must be fenced before any destructive DR operation.
-        """
+        """Production must be fenced before destructive DR operations."""
 
         if operator_reason is not None:
             operator_reason = operator_reason.strip()
@@ -423,6 +474,8 @@ class RecoveryManager:
             )
 
     def _verify_fencing(self) -> None:
+        """Verify that production fencing was actually confirmed."""
+
         if self.fencing_result is None:
             raise RecoveryError(
                 "Fencing result is unavailable"
@@ -438,6 +491,8 @@ class RecoveryManager:
     # ------------------------------------------------------------------
 
     def _validate_dr_preflight(self) -> None:
+        """Validate DR availability and required recovery disk space."""
+
         result = self.tsm.status()
 
         if not result.success:
@@ -467,11 +522,18 @@ class RecoveryManager:
             exist_ok=True,
         )
 
-        disk = shutil.disk_usage(recovery_root)
+        disk = shutil.disk_usage(
+            recovery_root
+        )
 
         required_gb = float(
             self.config.backup["minimum_free_space_gb"]
         )
+
+        if required_gb <= 0:
+            raise RecoveryError(
+                "Configured minimum free space must be positive"
+            )
 
         required_bytes = int(
             required_gb * 1024 * 1024 * 1024
@@ -487,6 +549,8 @@ class RecoveryManager:
     # ------------------------------------------------------------------
 
     def _prepare_work_directory(self) -> None:
+        """Create a unique isolated recovery workspace."""
+
         recovery_root = Path(
             self.config.paths["recovery_work_dir"]
         ).resolve()
@@ -504,7 +568,9 @@ class RecoveryManager:
             f"recovery_{timestamp}_{self.run_id}"
         )
 
-        work_dir = recovery_root / directory_name
+        work_dir = (
+            recovery_root / directory_name
+        )
 
         if work_dir.exists():
             raise RecoveryError(
@@ -526,55 +592,76 @@ class RecoveryManager:
         self,
         manifest_blob: Optional[str],
     ) -> None:
+        """Acquire and validate the selected recovery manifest."""
+
         if manifest_blob:
-            blob_name = self._validate_blob_reference(
-                manifest_blob
+            blob_name = (
+                self._validate_blob_reference(
+                    manifest_blob
+                )
             )
         else:
-            blob_name = self._resolve_latest_manifest_blob()
+            blob_name = (
+                self._resolve_latest_manifest_blob()
+            )
 
-        local_manifest = self._download_blob_to_file(
-            blob_name=blob_name,
-            destination=self._require_work_dir() / "manifest.json",
-            maximum_size=self.MAX_MANIFEST_SIZE_BYTES,
+        local_manifest = (
+            self._download_blob_to_file(
+                blob_name=blob_name,
+                destination=(
+                    self._require_work_dir()
+                    / "manifest.json"
+                ),
+                maximum_size=(
+                    self.MAX_MANIFEST_SIZE_BYTES
+                ),
+            )
         )
 
-        manifest = self._load_manifest(local_manifest)
+        manifest = self._load_manifest(
+            local_manifest
+        )
 
-        self._validate_manifest(manifest)
+        self._validate_manifest(
+            manifest
+        )
 
         self.manifest = manifest
 
-        self._set_backup_timestamp(manifest)
+        self._set_backup_timestamp(
+            manifest
+        )
 
     def _resolve_latest_manifest_blob(self) -> str:
-        """
-        Resolve the newest manifest from the controlled backup prefix.
-
-        The storage container should be RBAC-restricted so that recovery
-        identities cannot arbitrarily modify or delete backup artifacts.
-        """
+        """Resolve the newest manifest under the controlled backup prefix."""
 
         blobs = self.azure.list_blobs(
             prefix="backups/"
         )
 
-        candidates = []
+        candidates: List[str] = []
 
         for blob in blobs:
-            name = self._extract_blob_name(blob)
+            name = self._extract_blob_name(
+                blob
+            )
 
             if not name:
                 continue
 
-            normalized = name.replace("\\", "/")
+            normalized = name.replace(
+                "\\",
+                "/",
+            )
 
             if (
                 normalized.startswith("backups/")
                 and "/manifest_" in normalized
                 and normalized.endswith(".json")
             ):
-                candidates.append(normalized)
+                candidates.append(
+                    normalized
+                )
 
         if not candidates:
             raise RecoveryError(
@@ -588,7 +675,11 @@ class RecoveryManager:
         )
 
     @staticmethod
-    def _extract_blob_name(blob: Any) -> Optional[str]:
+    def _extract_blob_name(
+        blob: Any,
+    ) -> Optional[str]:
+        """Extract a blob name from common Azure SDK result formats."""
+
         if isinstance(blob, str):
             return blob
 
@@ -598,7 +689,11 @@ class RecoveryManager:
             if isinstance(value, str):
                 return value
 
-        value = getattr(blob, "name", None)
+        value = getattr(
+            blob,
+            "name",
+            None,
+        )
 
         if isinstance(value, str):
             return value
@@ -609,12 +704,17 @@ class RecoveryManager:
         self,
         blob_name: str,
     ) -> str:
+        """Validate a manifest-supplied Azure Blob path."""
+
         if not isinstance(blob_name, str):
             raise RecoveryError(
                 "Blob reference must be a string"
             )
 
-        value = blob_name.strip().replace("\\", "/")
+        value = blob_name.strip().replace(
+            "\\",
+            "/",
+        )
 
         if not value:
             raise RecoveryError(
@@ -636,6 +736,11 @@ class RecoveryManager:
                 "Drive-qualified blob paths are not permitted"
             )
 
+        if len(value) > 1024:
+            raise RecoveryError(
+                "Blob path is too long"
+            )
+
         parts = value.split("/")
 
         if any(
@@ -651,28 +756,29 @@ class RecoveryManager:
                 "Blob must be located under backups/"
             )
 
-        if not value.endswith(".json") and not value.endswith(".tsbak"):
+        if not (
+            value.endswith(".json")
+            or value.endswith(".tsbak")
+        ):
             raise RecoveryError(
                 "Unsupported recovery artifact type"
-            )
-
-        if len(value) > 1024:
-            raise RecoveryError(
-                "Blob path is too long"
             )
 
         return value
 
     # ------------------------------------------------------------------
-    # Manifest loading and validation
+    # Manifest validation
     # ------------------------------------------------------------------
 
     def _load_manifest(
         self,
         manifest_path: Path,
     ) -> Dict[str, Any]:
+        """Load a bounded UTF-8 JSON manifest."""
+
         try:
             raw = manifest_path.read_bytes()
+
         except OSError as exc:
             raise RecoveryError(
                 "Unable to read recovery manifest"
@@ -687,7 +793,11 @@ class RecoveryManager:
             manifest = json.loads(
                 raw.decode("utf-8")
             )
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
             raise RecoveryError(
                 "Recovery manifest is not valid UTF-8 JSON"
             ) from exc
@@ -703,33 +813,70 @@ class RecoveryManager:
         self,
         manifest: Dict[str, Any],
     ) -> None:
-        if manifest.get("manifest_version") != self.MANIFEST_VERSION:
+        """Validate manifest schema and trust boundaries."""
+
+        if manifest.get(
+            "manifest_version"
+        ) != self.MANIFEST_VERSION:
             raise RecoveryError(
                 "Unsupported manifest version"
             )
 
-        if manifest.get("status") != self.MANIFEST_STATUS:
+        if manifest.get(
+            "status"
+        ) != self.MANIFEST_STATUS:
             raise RecoveryError(
                 "Manifest is not marked ARTIFACTS_READY"
             )
 
-        manifest_run_id = manifest.get("run_id")
+        # The backup run ID identifies the backup operation.
+        # It must be independently valid but must not equal the
+        # recovery run ID because recovery normally restores a
+        # backup created during an earlier operation.
+        manifest_run_id = manifest.get(
+            "run_id"
+        )
 
-        if manifest_run_id != self.run_id:
+        if not isinstance(
+            manifest_run_id,
+            str,
+        ):
             raise RecoveryError(
-                "Manifest run_id does not match recovery run_id"
+                "Manifest run_id is missing"
             )
 
-        source = manifest.get("source")
+        try:
+            self._validate_run_id(
+                manifest_run_id
+            )
+        except ValueError as exc:
+            raise RecoveryError(
+                "Manifest run_id is invalid"
+            ) from exc
 
-        if not isinstance(source, dict):
+        source = manifest.get(
+            "source"
+        )
+
+        if not isinstance(
+            source,
+            dict,
+        ):
             raise RecoveryError(
                 "Manifest source section is invalid"
             )
 
-        source_version = source.get("version")
-        source_hostname = source.get("hostname")
-        source_identity_store = source.get("identity_store")
+        source_version = source.get(
+            "version"
+        )
+
+        source_hostname = source.get(
+            "hostname"
+        )
+
+        source_identity_store = source.get(
+            "identity_store"
+        )
 
         if not source_version:
             raise RecoveryError(
@@ -746,7 +893,9 @@ class RecoveryManager:
                 "Manifest identity store is missing"
             )
 
-        dr_version = self.config.environment["version"]
+        dr_version = self.config.environment[
+            "version"
+        ]
 
         validate_tableau_version(
             source_version,
@@ -760,15 +909,11 @@ class RecoveryManager:
             ]["identity_store"],
         )
 
-        configured_production_hostname = (
-            str(
-                self.config.servers[
-                    "production"
-                ]["hostname"]
-            )
-            .strip()
-            .lower()
-        )
+        configured_production_hostname = str(
+            self.config.servers[
+                "production"
+            ]["hostname"]
+        ).strip().lower()
 
         if (
             str(source_hostname)
@@ -780,9 +925,14 @@ class RecoveryManager:
                 "Manifest source hostname does not match production"
             )
 
-        timing = manifest.get("timing")
+        timing = manifest.get(
+            "timing"
+        )
 
-        if not isinstance(timing, dict):
+        if not isinstance(
+            timing,
+            dict,
+        ):
             raise RecoveryError(
                 "Manifest timing section is invalid"
             )
@@ -799,22 +949,31 @@ class RecoveryManager:
                 "Manifest backup timestamp is missing"
             )
 
-        backup_created_dt = self._parse_utc_timestamp(
-            backup_created
+        backup_created_dt = (
+            self._parse_utc_timestamp(
+                backup_created
+            )
         )
 
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(
+            dt.timezone.utc
+        )
 
-        if backup_created_dt > now + dt.timedelta(
-            minutes=5
+        if backup_created_dt > (
+            now + dt.timedelta(minutes=5)
         ):
             raise RecoveryError(
                 "Manifest backup timestamp is in the future"
             )
 
-        artifacts = manifest.get("artifacts")
+        artifacts = manifest.get(
+            "artifacts"
+        )
 
-        if not isinstance(artifacts, dict):
+        if not isinstance(
+            artifacts,
+            dict,
+        ):
             raise RecoveryError(
                 "Manifest artifacts section is invalid"
             )
@@ -829,12 +988,14 @@ class RecoveryManager:
                 "Required recovery artifacts are missing"
             )
 
-        for logical_name in self.REQUIRED_ARTIFACTS:
-            metadata = artifacts.get(logical_name)
-
+        for logical_name in (
+            self.REQUIRED_ARTIFACTS
+        ):
             self._validate_artifact_metadata(
                 logical_name,
-                metadata,
+                artifacts.get(
+                    logical_name
+                ),
             )
 
     def _validate_artifact_metadata(
@@ -842,18 +1003,37 @@ class RecoveryManager:
         logical_name: str,
         metadata: Any,
     ) -> None:
-        if not isinstance(metadata, dict):
+        """Validate one recovery artifact's metadata."""
+
+        if not isinstance(
+            metadata,
+            dict,
+        ):
             raise RecoveryError(
                 f"Invalid metadata for artifact {logical_name}"
             )
 
-        filename = metadata.get("filename")
-        blob_path = metadata.get("blob_path")
-        sha256 = metadata.get("sha256")
-        size_bytes = metadata.get("size_bytes")
+        filename = metadata.get(
+            "filename"
+        )
+
+        blob_path = metadata.get(
+            "blob_path"
+        )
+
+        sha256 = metadata.get(
+            "sha256"
+        )
+
+        size_bytes = metadata.get(
+            "size_bytes"
+        )
 
         if (
-            not isinstance(filename, str)
+            not isinstance(
+                filename,
+                str,
+            )
             or not filename
         ):
             raise RecoveryError(
@@ -875,7 +1055,10 @@ class RecoveryManager:
                 f"Unexpected filename for {logical_name}"
             )
 
-        if not isinstance(blob_path, str):
+        if not isinstance(
+            blob_path,
+            str,
+        ):
             raise RecoveryError(
                 f"Missing blob path for {logical_name}"
             )
@@ -895,14 +1078,23 @@ class RecoveryManager:
             )
         ):
             raise RecoveryError(
-                f"Artifact blob path does not match logical name: {logical_name}"
+                "Artifact blob path does not match "
+                f"logical name: {logical_name}"
             )
 
-        self._validate_sha256(sha256)
+        self._validate_sha256(
+            sha256
+        )
 
         if (
-            isinstance(size_bytes, bool)
-            or not isinstance(size_bytes, int)
+            isinstance(
+                size_bytes,
+                bool,
+            )
+            or not isinstance(
+                size_bytes,
+                int,
+            )
         ):
             raise RecoveryError(
                 f"Invalid size for {logical_name}"
@@ -913,9 +1105,12 @@ class RecoveryManager:
                 f"Artifact size must be positive: {logical_name}"
             )
 
-        if size_bytes > self.MAX_ARTIFACT_SIZE_BYTES:
+        if size_bytes > (
+            self.MAX_ARTIFACT_SIZE_BYTES
+        ):
             raise RecoveryError(
-                f"Artifact exceeds maximum allowed size: {logical_name}"
+                "Artifact exceeds maximum allowed size: "
+                f"{logical_name}"
             )
 
     @classmethod
@@ -923,28 +1118,41 @@ class RecoveryManager:
         cls,
         value: Any,
     ) -> str:
-        if not isinstance(value, str):
+        """Validate a SHA-256 hexadecimal digest."""
+
+        if not isinstance(
+            value,
+            str,
+        ):
             raise RecoveryError(
                 "SHA-256 value must be a string"
             )
 
-        value = value.strip().lower()
+        normalized = value.strip().lower()
 
-        if not cls.SHA256_PATTERN.fullmatch(value):
+        if not cls.SHA256_PATTERN.fullmatch(
+            normalized
+        ):
             raise RecoveryError(
                 "Invalid SHA-256 value"
             )
 
-        return value
+        return normalized
 
     @staticmethod
     def _parse_utc_timestamp(
         value: str,
     ) -> dt.datetime:
+        """Parse an ISO-8601 timestamp and normalize to UTC."""
+
         try:
             parsed = dt.datetime.fromisoformat(
-                value.replace("Z", "+00:00")
+                value.replace(
+                    "Z",
+                    "+00:00",
+                )
             )
+
         except ValueError as exc:
             raise RecoveryError(
                 "Invalid UTC timestamp"
@@ -963,13 +1171,21 @@ class RecoveryManager:
         self,
         manifest: Dict[str, Any],
     ) -> None:
-        timing = manifest.get("timing", {})
+        """Store the validated backup creation timestamp."""
+
+        timing = manifest.get(
+            "timing",
+            {},
+        )
 
         timestamp = timing.get(
             "backup_created_at_utc"
         )
 
-        if isinstance(timestamp, str):
+        if isinstance(
+            timestamp,
+            str,
+        ):
             self.backup_created_at = (
                 self._parse_utc_timestamp(
                     timestamp
@@ -988,8 +1204,17 @@ class RecoveryManager:
         maximum_size: int,
         expected_size: Optional[int] = None,
     ) -> Path:
-        blob_name = self._validate_blob_reference(
-            blob_name
+        """
+        Stream a Blob into the isolated recovery workspace.
+
+        Both the remote size and the actual streamed byte count are
+        bounded. Manifest-provided size is treated as untrusted input.
+        """
+
+        blob_name = (
+            self._validate_blob_reference(
+                blob_name
+            )
         )
 
         if maximum_size <= 0:
@@ -997,12 +1222,36 @@ class RecoveryManager:
                 "Invalid maximum download size"
             )
 
-        destination = destination.resolve()
+        if (
+            expected_size is not None
+            and (
+                isinstance(
+                    expected_size,
+                    bool,
+                )
+                or not isinstance(
+                    expected_size,
+                    int,
+                )
+                or expected_size <= 0
+                or expected_size > maximum_size
+            )
+        ):
+            raise RecoveryError(
+                "Invalid expected download size"
+            )
 
-        work_dir = self._require_work_dir().resolve()
+        destination = destination.resolve()
+        work_dir = (
+            self._require_work_dir()
+            .resolve()
+        )
 
         try:
-            destination.relative_to(work_dir)
+            destination.relative_to(
+                work_dir
+            )
+
         except ValueError as exc:
             raise RecoveryError(
                 "Download destination escapes recovery workspace"
@@ -1024,6 +1273,7 @@ class RecoveryManager:
                     blob_name
                 )
             )
+
         except AzureError as exc:
             raise RecoveryError(
                 "Unable to retrieve recovery artifact properties"
@@ -1036,16 +1286,23 @@ class RecoveryManager:
         )
 
         if (
-            isinstance(remote_size, int)
-            and remote_size > maximum_size
+            not isinstance(
+                remote_size,
+                int,
+            )
+            or remote_size < 0
         ):
+            raise RecoveryError(
+                "Remote recovery artifact size is unavailable"
+            )
+
+        if remote_size > maximum_size:
             raise RecoveryError(
                 "Remote recovery artifact exceeds allowed size"
             )
 
         if (
             expected_size is not None
-            and isinstance(remote_size, int)
             and remote_size != expected_size
         ):
             raise RecoveryError(
@@ -1055,8 +1312,10 @@ class RecoveryManager:
         total_bytes = 0
 
         try:
-            stream = self.azure.download_blob_stream(
-                blob_name
+            stream = (
+                self.azure.download_blob_stream(
+                    blob_name
+                )
             )
 
             with destination.open(
@@ -1068,11 +1327,10 @@ class RecoveryManager:
 
                     total_bytes += len(chunk)
 
-                    # HARD streaming limit.
-                    # Do not trust Content-Length or manifest size.
                     if total_bytes > maximum_size:
                         raise RecoveryError(
-                            "Recovery artifact exceeded streaming size limit"
+                            "Recovery artifact exceeded "
+                            "streaming size limit"
                         )
 
                     if (
@@ -1080,37 +1338,63 @@ class RecoveryManager:
                         and total_bytes > expected_size
                     ):
                         raise RecoveryError(
-                            "Downloaded artifact exceeded manifest size"
+                            "Downloaded artifact exceeded "
+                            "manifest size"
                         )
 
                     output.write(chunk)
 
         except RecoveryError:
-            self._safe_delete_file(destination)
+            self._safe_delete_file(
+                destination
+            )
             raise
 
-        except (OSError, AzureError) as exc:
-            self._safe_delete_file(destination)
+        except (
+            OSError,
+            AzureError,
+        ) as exc:
+            self._safe_delete_file(
+                destination
+            )
 
             raise RecoveryError(
                 "Unable to download recovery artifact"
             ) from exc
 
-        if expected_size is not None:
-            if total_bytes != expected_size:
-                self._safe_delete_file(destination)
+        if total_bytes != remote_size:
+            self._safe_delete_file(
+                destination
+            )
 
-                raise RecoveryError(
-                    "Downloaded artifact size does not match manifest"
-                )
+            raise RecoveryError(
+                "Downloaded artifact size does not match "
+                "remote Blob size"
+            )
+
+        if (
+            expected_size is not None
+            and total_bytes != expected_size
+        ):
+            self._safe_delete_file(
+                destination
+            )
+
+            raise RecoveryError(
+                "Downloaded artifact size does not match manifest"
+            )
 
         return destination
 
     # ------------------------------------------------------------------
-    # Artifact restore preparation
+    # Artifact validation
     # ------------------------------------------------------------------
 
-    def _download_and_validate_artifacts(self) -> None:
+    def _download_and_validate_artifacts(
+        self,
+    ) -> None:
+        """Download and independently validate every required artifact."""
+
         if self.manifest is None:
             raise RecoveryError(
                 "Manifest has not been loaded"
@@ -1120,7 +1404,10 @@ class RecoveryManager:
             "artifacts"
         )
 
-        if not isinstance(artifacts, dict):
+        if not isinstance(
+            artifacts,
+            dict,
+        ):
             raise RecoveryError(
                 "Manifest artifacts are invalid"
             )
@@ -1135,25 +1422,41 @@ class RecoveryManager:
                 logical_name
             )
 
-            if not isinstance(metadata, dict):
+            if not isinstance(
+                metadata,
+                dict,
+            ):
                 raise RecoveryError(
                     f"Missing artifact metadata: {logical_name}"
                 )
 
-            blob_path = self._validate_blob_reference(
-                metadata["blob_path"]
+            blob_path = (
+                self._validate_blob_reference(
+                    metadata["blob_path"]
+                )
             )
 
-            expected_sha256 = self._validate_sha256(
-                metadata["sha256"]
+            expected_sha256 = (
+                self._validate_sha256(
+                    metadata["sha256"]
+                )
             )
 
-            expected_size = metadata["size_bytes"]
+            expected_size = metadata[
+                "size_bytes"
+            ]
 
             if (
-                isinstance(expected_size, bool)
-                or not isinstance(expected_size, int)
+                isinstance(
+                    expected_size,
+                    bool,
+                )
+                or not isinstance(
+                    expected_size,
+                    int,
+                )
                 or expected_size <= 0
+                or expected_size > self.MAX_ARTIFACT_SIZE_BYTES
             ):
                 raise RecoveryError(
                     f"Invalid expected size: {logical_name}"
@@ -1167,7 +1470,9 @@ class RecoveryManager:
                 self._download_blob_to_file(
                     blob_name=blob_path,
                     destination=destination,
-                    maximum_size=self.MAX_ARTIFACT_SIZE_BYTES,
+                    maximum_size=(
+                        self.MAX_ARTIFACT_SIZE_BYTES
+                    ),
                     expected_size=expected_size,
                 )
             )
@@ -1176,7 +1481,19 @@ class RecoveryManager:
                 local_file
             )
 
-            actual_size = local_file.stat().st_size
+            try:
+                actual_size = (
+                    local_file.stat().st_size
+                )
+            except OSError as exc:
+                self._safe_delete_file(
+                    local_file
+                )
+
+                raise RecoveryError(
+                    f"Unable to determine local artifact size: "
+                    f"{logical_name}"
+                ) from exc
 
             if actual_size != expected_size:
                 self._safe_delete_file(
@@ -1187,10 +1504,8 @@ class RecoveryManager:
                     f"Local artifact size mismatch: {logical_name}"
                 )
 
-            actual_sha256 = (
-                sha256_file(
-                    local_file
-                )
+            actual_sha256 = sha256_file(
+                local_file
             )
 
             if not self._constant_time_equal(
@@ -1205,32 +1520,47 @@ class RecoveryManager:
                     f"SHA-256 validation failed: {logical_name}"
                 )
 
-            # Verify the remote object again after local
-            # download. This protects against a mismatch between
-            # the object initially inspected and the object read.
-            if not self.azure.verify_remote_blob(
-                blob_path,
-                expected_size=expected_size,
-                expected_sha256=expected_sha256,
-                verify_content_stream=bool(
-                    self.config.backup[
-                        "verify_remote_content_sha256"
-                    ]
-                ),
-            ):
+            remote_verified = (
+                self.azure.verify_remote_blob(
+                    blob_path,
+                    expected_size_bytes=expected_size,
+                    expected_sha256=expected_sha256,
+                    verify_content_stream=bool(
+                        self.config.backup[
+                            "verify_remote_content_sha256"
+                        ]
+                    ),
+                )
+            )
+
+            if not remote_verified:
+                self._safe_delete_file(
+                    local_file
+                )
+
                 raise RecoveryError(
-                    f"Remote artifact verification failed: {logical_name}"
+                    "Remote artifact verification failed: "
+                    f"{logical_name}"
                 )
 
     def _validate_local_target(
         self,
         target: Path,
     ) -> None:
-        work_dir = self._require_work_dir().resolve()
+        """Ensure a local recovery artifact remains inside the workspace."""
+
+        work_dir = (
+            self._require_work_dir()
+            .resolve()
+        )
+
         target = target.resolve()
 
         try:
-            target.relative_to(work_dir)
+            target.relative_to(
+                work_dir
+            )
+
         except ValueError as exc:
             raise RecoveryError(
                 "Recovery artifact escapes isolated workspace"
@@ -1251,10 +1581,10 @@ class RecoveryManager:
     # ------------------------------------------------------------------
 
     def _stop_dr(self) -> None:
+        """Stop Tableau Server before repository restoration."""
+
         result = self.tsm.run(
-            [
-                "stop",
-            ]
+            ["stop"]
         )
 
         if not result.success:
@@ -1267,6 +1597,8 @@ class RecoveryManager:
     # ------------------------------------------------------------------
 
     def _restore_repository(self) -> None:
+        """Restore the validated Tableau repository backup."""
+
         backup_file = (
             self._require_work_dir()
             / "backup.tsbak"
@@ -1300,6 +1632,8 @@ class RecoveryManager:
     # ------------------------------------------------------------------
 
     def _import_settings(self) -> None:
+        """Import validated Tableau Server settings."""
+
         settings_file = (
             self._require_work_dir()
             / "settings.json"
@@ -1332,7 +1666,15 @@ class RecoveryManager:
     # Stage 8 - Security rebound
     # ------------------------------------------------------------------
 
-    def _apply_key_vault_security_bindings(self) -> None:
+    def _apply_key_vault_security_bindings(
+        self,
+    ) -> None:
+        """
+        Retrieve SSL material from Key Vault and apply it to Tableau.
+
+        Secret values are never written to logs.
+        """
+
         key_vault_name = str(
             self.config.azure[
                 "key_vault_name"
@@ -1446,12 +1788,18 @@ class RecoveryManager:
 
         except AzureError as exc:
             raise RecoveryError(
-                "Unable to retrieve required security material from Key Vault"
+                "Unable to retrieve required security material "
+                "from Key Vault"
             ) from exc
 
         finally:
-            self._safe_delete_file(cert_path)
-            self._safe_delete_file(key_path)
+            self._safe_delete_file(
+                cert_path
+            )
+
+            self._safe_delete_file(
+                key_path
+            )
 
             if cert_path is not None:
                 self._safe_delete_directory(
@@ -1463,33 +1811,39 @@ class RecoveryManager:
         path: Path,
         value: str,
     ) -> None:
-        if not isinstance(value, str) or not value:
+        """Write a temporary secret file with restrictive permissions."""
+
+        if not isinstance(
+            value,
+            str,
+        ) or not value:
             raise RecoveryError(
                 "Secret value is invalid"
             )
 
-        path.write_text(
-            value,
-            encoding="utf-8",
-        )
+        try:
+            path.write_text(
+                value,
+                encoding="utf-8",
+            )
 
-        if os.name != "nt":
-            try:
+            if os.name != "nt":
                 path.chmod(0o600)
-            except OSError as exc:
-                raise RecoveryError(
-                    "Unable to secure temporary secret file"
-                ) from exc
+
+        except OSError as exc:
+            raise RecoveryError(
+                "Unable to create secure temporary secret file"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Stage 9 - Start DR
     # ------------------------------------------------------------------
 
     def _start_dr(self) -> None:
+        """Start Tableau Server after recovery configuration."""
+
         result = self.tsm.run(
-            [
-                "start",
-            ]
+            ["start"]
         )
 
         if not result.success:
@@ -1502,6 +1856,8 @@ class RecoveryManager:
     # ------------------------------------------------------------------
 
     def _validate_health(self) -> None:
+        """Require successful post-recovery health validation."""
+
         self.health_result = (
             self.health_checker.check()
         )
@@ -1521,6 +1877,8 @@ class RecoveryManager:
         status: str,
         total_rto_seconds: float,
     ) -> RecoveryResult:
+        """Build the structured recovery result."""
+
         backup_age: Optional[float] = None
 
         if self.backup_created_at is not None:
@@ -1532,14 +1890,18 @@ class RecoveryManager:
             if backup_age < 0:
                 backup_age = 0.0
 
-        fencing_dict: Optional[Dict[str, Any]] = None
+        fencing_dict: Optional[
+            Dict[str, Any]
+        ] = None
 
         if self.fencing_result is not None:
             fencing_dict = asdict(
                 self.fencing_result
             )
 
-        health_dict: Optional[Dict[str, Any]] = None
+        health_dict: Optional[
+            Dict[str, Any]
+        ] = None
 
         if self.health_result is not None:
             health_dict = asdict(
@@ -1553,14 +1915,15 @@ class RecoveryManager:
             completed_steps=list(
                 self.completed_steps
             ),
-            failed_step=self.failed_step
-            if status == "FAILED"
-            else None,
+            failed_step=(
+                self.failed_step
+                if status == "FAILED"
+                else None
+            ),
             fencing_result=fencing_dict,
             health_result=health_dict,
             disaster_declared_at_utc=(
-                self.disaster_declared_at
-                .isoformat()
+                self.disaster_declared_at.isoformat()
             ),
             recovery_completed_at_utc=(
                 self.recovery_completed_at.isoformat()
@@ -1587,6 +1950,8 @@ class RecoveryManager:
     # ------------------------------------------------------------------
 
     def _require_work_dir(self) -> Path:
+        """Return the active isolated recovery workspace."""
+
         if self.work_dir is None:
             raise RecoveryError(
                 "Recovery workspace has not been initialized"
@@ -1594,12 +1959,10 @@ class RecoveryManager:
 
         return self.work_dir
 
-    def _preserve_failed_recovery_workspace(self) -> None:
-        """
-        Failed recovery artifacts are deliberately preserved.
-
-        They may be required for incident investigation.
-        """
+    def _preserve_failed_recovery_workspace(
+        self,
+    ) -> None:
+        """Preserve failed recovery artifacts for incident investigation."""
 
         if self.work_dir is None:
             return
@@ -1628,23 +1991,28 @@ class RecoveryManager:
     def _safe_delete_file(
         path: Optional[Path],
     ) -> None:
+        """Best-effort file deletion without masking the original failure."""
+
         if path is None:
             return
 
         try:
             if path.exists():
                 path.unlink()
+
         except OSError:
-            # Never mask the original recovery failure.
             pass
 
     @staticmethod
     def _safe_delete_directory(
         path: Path,
     ) -> None:
+        """Best-effort removal of an empty temporary directory."""
+
         try:
             if path.exists():
                 path.rmdir()
+
         except OSError:
             pass
 
@@ -1657,13 +2025,17 @@ class RecoveryManager:
         left: str,
         right: str,
     ) -> bool:
+        """Compare hexadecimal digests using constant-time comparison."""
+
         try:
             left_bytes = bytes.fromhex(
                 left
             )
+
             right_bytes = bytes.fromhex(
                 right
             )
+
         except ValueError:
             return False
 

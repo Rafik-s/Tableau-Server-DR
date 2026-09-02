@@ -1,39 +1,65 @@
-"""Enterprise Tableau Server backup orchestration with integrity-first persistence."""
+"""
+Enterprise Tableau Server Disaster Recovery backup orchestrator.
+
+Backup workflow:
+
+    BACKUP_STARTED
+        -> PREFLIGHT_PASSED
+        -> SETTINGS_EXPORTED
+        -> BACKUP_CREATED
+        -> ARTIFACTS_VALIDATED
+        -> MANIFEST_CREATED
+        -> AZURE_UPLOADED
+        -> REMOTE_VERIFIED
+        -> LOCAL_CLEANUP
+        -> BACKUP_COMPLETED
+
+Security principles:
+- Never upload an artifact that has not passed local validation.
+- Calculate SHA-256 before remote persistence.
+- Store SHA-256 and size metadata with every Azure Blob artifact.
+- Verify every uploaded Blob before declaring backup success.
+- Never delete local staging before remote verification succeeds.
+- Preserve failed staging data for incident investigation.
+- Never log secrets or raw subprocess output.
+- Use isolated run-specific workspaces.
+- Keep backup and recovery run IDs independent.
+"""
 
 from __future__ import annotations
 
-import datetime
+import datetime as dt
+import hashlib
+import hmac
 import json
 import logging
+import re
 import shutil
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from tableau_dr.azure_manager import AzureManager
-from tableau_dr.config import Config
-from tableau_dr.exceptions import IntegrityError, TableauDRError, ValidationError
-from tableau_dr.security import sha256_file, validate_file
-from tableau_dr.tab_server_connector import TSMConnector
-from tableau_dr.validation import validate_disk_space
+from azure.core.exceptions import AzureError
+
+from .azure_manager import AzureManager
+from .config import Config
+from .exceptions import TableauDRError, ValidationError
+from .security import sha256_file, validate_file
+from .tab_server_connector import TSMConnector
+from .validation import validate_disk_space
 
 
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
-MANIFEST_VERSION = "2.0"
-MANIFEST_STATUS = "ARTIFACTS_READY"
 
-SETTINGS_KEY = "settings.json"
-BACKUP_KEY = "backup.tsbak"
-
-DEFAULT_MIN_BACKUP_SIZE_MB = 10.0
-DEFAULT_MIN_FREE_SPACE_GB = 50.0
+class BackupError(TableauDRError):
+    """Controlled backup pipeline failure."""
 
 
 @dataclass
 class BackupResult:
-    """Final result of a completed or failed backup pipeline."""
+    """Structured result returned by the backup workflow."""
 
     run_id: str
     status: str
@@ -41,271 +67,207 @@ class BackupResult:
     completed_at_utc: str
     duration_seconds: float
     manifest_path: str
-    artifacts: Dict[str, dict]
+    artifacts: Dict[str, Dict[str, Any]]
     remote_verified: bool
     cleanup_status: str
 
-    def to_dict(self) -> dict:
-        """Return a JSON-serializable representation."""
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the result as a serializable dictionary."""
 
         return asdict(self)
 
 
 class BackupManager:
-    """
-    Execute the complete Tableau Server backup pipeline.
+    """Enterprise fail-closed Tableau Server backup orchestrator."""
 
-    Pipeline:
+    MANIFEST_VERSION = "2.0"
+    MANIFEST_STATUS = "ARTIFACTS_READY"
 
-        Preflight
-            ↓
-        Settings Export
-            ↓
-        TSM Backup
-            ↓
-        Local Validation + SHA-256
-            ↓
-        Manifest Generation
-            ↓
-        Azure Upload
-            ↓
-        Remote Integrity Verification
-            ↓
-        Retention Cleanup
+    MAX_MANIFEST_SIZE_BYTES = 10 * 1024 * 1024
+    MAX_ARTIFACT_SIZE_BYTES = 1024 * 1024 * 1024 * 1024
 
-    Cleanup is fail-closed: local staging is removed only after every
-    required artifact and the manifest have been successfully uploaded
-    and remotely verified.
-    """
+    SHA256_PATTERN = re.compile(
+        r"^[a-fA-F0-9]{64}$"
+    )
 
-    def __init__(self, config: Config, run_id: str) -> None:
-        """Initialize backup dependencies and an isolated run directory."""
+    RUN_ID_PATTERN = re.compile(
+        r"^[A-Za-z0-9_.-]+$"
+    )
 
-        if not isinstance(run_id, str) or not run_id.strip():
-            raise ValueError("run_id must be a non-empty string.")
+    SAFE_ARTIFACT_NAMES = {
+        "backup.tsbak",
+        "settings.json",
+    }
+
+    def __init__(
+        self,
+        config: Config,
+        run_id: str,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        """Initialize the backup pipeline."""
 
         self.config = config
-        self.run_id = run_id.strip()
-
-        yaml_executable = (
-            config.tsm.get("executable")
-            if config.tsm
-            else None
-        )
+        self.run_id = self._validate_run_id(run_id)
+        self.logger = logger or LOGGER
 
         self.tsm = TSMConnector(
-            yaml_executable=yaml_executable,
+            config=config,
+            logger=self.logger,
         )
-
-        azure_cfg = config.azure
 
         self.azure = AzureManager(
-            account_name=azure_cfg["storage_account_name"],
-            container_name=azure_cfg["storage_container"],
-            max_retries=azure_cfg.get("max_retries", 3),
-            backoff_factor=azure_cfg.get(
-                "retry_backoff_factor",
-                0.8,
-            ),
+            account_name=config.azure[
+                "storage_account_name"
+            ],
+            container_name=config.azure[
+                "storage_container"
+            ],
+            max_retries=config.azure[
+                "max_retries"
+            ],
+            backoff_factor=config.azure[
+                "retry_backoff_factor"
+            ],
         )
 
-        self.started_at_dt = datetime.datetime.now(
-            datetime.timezone.utc
+        self.started_at = dt.datetime.now(
+            dt.timezone.utc
         )
 
-        self.timestamp_str = self.started_at_dt.strftime(
+        self.timestamp = self.started_at.strftime(
             "%Y%m%dT%H%M%SZ"
         )
 
         self.run_dir_name = (
-            f"{self.timestamp_str}_{self.run_id}"
+            f"{self.timestamp}_{self.run_id}"
         )
 
-        base_backup_dir = Path(
+        self.backup_root = Path(
             config.paths["backup_dir"]
-        ).expanduser()
+        ).resolve()
 
         self.run_work_dir = (
-            base_backup_dir / self.run_dir_name
+            self.backup_root
+            / self.run_dir_name
         )
 
-    def execute_backup_pipeline(self) -> BackupResult:
-        """Execute the complete backup, upload, verification, and cleanup workflow."""
+        self.remote_blob_prefix = (
+            f"backups/{self.run_dir_name}"
+        )
+
+        self._validate_configuration()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def execute_backup_pipeline(
+        self,
+    ) -> BackupResult:
+        """
+        Execute the complete backup pipeline.
+
+        Local cleanup is performed only after every remote artifact,
+        including the manifest, has passed integrity verification.
+        """
 
         pipeline_start = time.monotonic()
 
-        logger.info(
-            "Starting Tableau DR backup pipeline. run_id=%s",
-            self.run_id,
-        )
+        artifacts: Dict[
+            str,
+            Dict[str, Any],
+        ] = {}
 
-        self._run_preflight()
-
-        self.run_work_dir.mkdir(
-            parents=True,
-            exist_ok=False,
-        )
-
-        local_artifacts: Dict[str, dict] = {}
-        remote_blob_prefix = (
-            f"backups/{self.run_dir_name}"
-        )
+        manifest_path: Optional[Path] = None
+        manifest_blob_path: Optional[str] = None
 
         remote_verified = False
         cleanup_status = "SKIPPED"
 
-        manifest_path: Path | None = None
-
         try:
-            # ---------------------------------------------------------
-            # 1. Export Tableau Server settings
-            # ---------------------------------------------------------
-            settings_filename = (
-                f"tableau_settings_{self.timestamp_str}.json"
+            self._run_preflight()
+
+            self._prepare_work_directory()
+
+            self.logger.info(
+                "Starting Tableau DR backup pipeline."
             )
+
+            # ----------------------------------------------------------
+            # Stage 1 - Export Tableau settings
+            # ----------------------------------------------------------
 
             settings_path = (
-                self.run_work_dir / settings_filename
+                self._export_settings()
             )
 
-            logger.info(
-                "Exporting Tableau Server settings."
-            )
-
-            self.tsm.export_settings(
-                str(settings_path)
-            )
-
-            validate_file(
-                settings_path,
-                must_exist=True,
-            )
-
-            settings_size = settings_path.stat().st_size
-            settings_sha256 = sha256_file(settings_path)
-
-            local_artifacts[SETTINGS_KEY] = (
+            settings_metadata = (
                 self._build_artifact_metadata(
-                    logical_name=SETTINGS_KEY,
+                    logical_name="settings.json",
                     local_path=settings_path,
-                    blob_path=(
-                        f"{remote_blob_prefix}/"
-                        f"{settings_filename}"
-                    ),
-                    sha256=settings_sha256,
-                    size_bytes=settings_size,
                 )
             )
 
-            # ---------------------------------------------------------
-            # 2. Create Tableau Server repository backup
-            # ---------------------------------------------------------
-            backup_filename = (
-                f"tableau_backup_{self.timestamp_str}.tsbak"
+            artifacts[
+                "settings.json"
+            ] = settings_metadata
+
+            # ----------------------------------------------------------
+            # Stage 2 - Create Tableau repository backup
+            # ----------------------------------------------------------
+
+            backup_created_at = (
+                dt.datetime.now(
+                    dt.timezone.utc
+                )
             )
 
             backup_path = (
-                self.run_work_dir / backup_filename
+                self._create_repository_backup()
             )
 
-            backup_stem_path = (
-                self.run_work_dir
-                / f"tableau_backup_{self.timestamp_str}"
-            )
-
-            logger.info(
-                "Creating Tableau Server .tsbak backup."
-            )
-
-            self.tsm.create_backup(
-                str(backup_stem_path),
-                append_date=False,
-            )
-
-            self._resolve_backup_output(
-                expected_path=backup_path,
-                output_stem=backup_stem_path,
-            )
-
-            minimum_backup_size_mb = float(
-                self.config.backup.get(
-                    "minimum_backup_size_mb",
-                    DEFAULT_MIN_BACKUP_SIZE_MB,
-                )
-            )
-
-            validate_file(
-                backup_path,
-                must_exist=True,
-                min_size_mb=minimum_backup_size_mb,
-            )
-
-            backup_size = backup_path.stat().st_size
-            backup_sha256 = sha256_file(backup_path)
-
-            local_artifacts[BACKUP_KEY] = (
+            backup_metadata = (
                 self._build_artifact_metadata(
-                    logical_name=BACKUP_KEY,
+                    logical_name="backup.tsbak",
                     local_path=backup_path,
-                    blob_path=(
-                        f"{remote_blob_prefix}/"
-                        f"{backup_filename}"
-                    ),
-                    sha256=backup_sha256,
-                    size_bytes=backup_size,
                 )
             )
 
-            # ---------------------------------------------------------
-            # 3. Generate manifest
-            # ---------------------------------------------------------
-            manifest_filename = (
-                f"manifest_{self.timestamp_str}.json"
-            )
+            artifacts[
+                "backup.tsbak"
+            ] = backup_metadata
+
+            # ----------------------------------------------------------
+            # Stage 3 - Generate manifest
+            # ----------------------------------------------------------
 
             manifest_path = (
-                self.run_work_dir / manifest_filename
-            )
-
-            manifest_data = (
-                self._build_manifest(
-                    artifacts=local_artifacts,
-                    remote_blob_prefix=remote_blob_prefix,
+                self._create_manifest(
+                    artifacts=artifacts,
+                    backup_created_at=backup_created_at,
+                    pipeline_start=pipeline_start,
                 )
             )
 
-            self._write_json(
-                manifest_path,
-                manifest_data,
-            )
-
-            validate_file(
-                manifest_path,
-                must_exist=True,
-            )
-
-            manifest_sha256 = sha256_file(
-                manifest_path
+            manifest_sha256 = (
+                self._validate_and_hash_manifest(
+                    manifest_path
+                )
             )
 
             manifest_blob_path = (
-                f"{remote_blob_prefix}/"
-                f"{manifest_filename}"
+                f"{self.remote_blob_prefix}/"
+                f"manifest_{self.timestamp}.json"
             )
 
-            # ---------------------------------------------------------
-            # 4. Upload all artifacts
-            # ---------------------------------------------------------
-            logger.info(
-                "Uploading backup artifacts to Azure Blob Storage."
-            )
+            # ----------------------------------------------------------
+            # Stage 4 - Upload artifacts
+            # ----------------------------------------------------------
 
-            for artifact in local_artifacts.values():
-                self.azure.upload_file(
-                    local_path=artifact["local_path"],
-                    blob_path=artifact["blob_path"],
-                    sha256_checksum=artifact["sha256"],
-                )
+            self._upload_artifacts(
+                artifacts
+            )
 
             self.azure.upload_file(
                 local_path=manifest_path,
@@ -313,350 +275,1058 @@ class BackupManager:
                 sha256_checksum=manifest_sha256,
             )
 
-            # ---------------------------------------------------------
-            # 5. Verify every remote object
-            # ---------------------------------------------------------
-            verify_stream = bool(
-                self.config.backup.get(
-                    "verify_remote_content_sha256",
-                    False,
-                )
-            )
+            # ----------------------------------------------------------
+            # Stage 5 - Verify remote artifacts
+            # ----------------------------------------------------------
 
-            logger.info(
-                "Verifying uploaded Azure Blob artifacts."
+            self._verify_remote_artifacts(
+                artifacts
             )
-
-            for artifact in local_artifacts.values():
-                self.azure.verify_remote_blob(
-                    blob_path=artifact["blob_path"],
-                    expected_size_bytes=artifact["size_bytes"],
-                    expected_sha256=artifact["sha256"],
-                    verify_content_stream=verify_stream,
-                )
 
             self.azure.verify_remote_blob(
                 blob_path=manifest_blob_path,
                 expected_size_bytes=manifest_path.stat().st_size,
                 expected_sha256=manifest_sha256,
-                verify_content_stream=verify_stream,
+                verify_content_stream=self._remote_content_verification_enabled(),
             )
 
             remote_verified = True
 
-            # ---------------------------------------------------------
-            # 6. Retention cleanup
-            # ---------------------------------------------------------
-            cleanup_status = self._execute_local_cleanup()
+            # ----------------------------------------------------------
+            # Stage 6 - Cleanup
+            # ----------------------------------------------------------
 
-            completed_at_dt = datetime.datetime.now(
-                datetime.timezone.utc
+            cleanup_status = (
+                self._execute_local_cleanup()
             )
 
-            duration_seconds = round(
-                time.monotonic() - pipeline_start,
-                2,
+            completed_at = (
+                dt.datetime.now(
+                    dt.timezone.utc
+                )
             )
 
-            logger.info(
-                "Tableau DR backup pipeline completed successfully. "
-                "run_id=%s duration_seconds=%s cleanup=%s",
-                self.run_id,
-                duration_seconds,
-                cleanup_status,
+            duration = (
+                time.monotonic()
+                - pipeline_start
+            )
+
+            self.logger.info(
+                "Tableau DR backup completed successfully."
             )
 
             return BackupResult(
                 run_id=self.run_id,
                 status="SUCCESS",
-                started_at_utc=self.started_at_dt.isoformat(),
-                completed_at_utc=completed_at_dt.isoformat(),
-                duration_seconds=duration_seconds,
+                started_at_utc=(
+                    self.started_at.isoformat()
+                ),
+                completed_at_utc=(
+                    completed_at.isoformat()
+                ),
+                duration_seconds=round(
+                    duration,
+                    3,
+                ),
                 manifest_path=manifest_blob_path,
-                artifacts=self._public_artifact_metadata(
-                    local_artifacts
+                artifacts=(
+                    self._public_artifact_metadata(
+                        artifacts
+                    )
                 ),
                 remote_verified=remote_verified,
                 cleanup_status=cleanup_status,
             )
 
         except Exception as exc:
-            logger.critical(
-                "Backup pipeline failed. "
-                "Local staging is being preserved for diagnosis. "
-                "run_id=%s error=%s",
-                self.run_id,
-                self._sanitize_error(exc),
+            self._preserve_failed_workspace()
+
+            self.logger.error(
+                "Tableau DR backup pipeline failed; "
+                "local staging workspace preserved."
             )
 
-            # Deliberately do not clean up here.
-            # A failed pipeline must preserve evidence and artifacts.
-            if isinstance(exc, TableauDRError):
+            if isinstance(
+                exc,
+                TableauDRError,
+            ):
                 raise
 
-            raise TableauDRError(
+            raise BackupError(
                 "Backup execution failed."
             ) from exc
 
-    def _run_preflight(self) -> None:
-        """Validate disk capacity and TSM availability before modifying state."""
+    # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
 
-        minimum_free_space_gb = float(
-            self.config.backup.get(
-                "minimum_free_space_gb",
-                DEFAULT_MIN_FREE_SPACE_GB,
+    @staticmethod
+    def _validate_run_id(
+        run_id: str,
+    ) -> str:
+        """Validate the backup execution identifier."""
+
+        if not isinstance(
+            run_id,
+            str,
+        ):
+            raise ValueError(
+                "run_id must be a string."
             )
+
+        value = run_id.strip()
+
+        if not value:
+            raise ValueError(
+                "run_id cannot be empty."
+            )
+
+        if len(value) > 128:
+            raise ValueError(
+                "run_id is too long."
+            )
+
+        if not BackupManager.RUN_ID_PATTERN.fullmatch(
+            value
+        ):
+            raise ValueError(
+                "run_id contains invalid characters."
+            )
+
+        return value
+
+    def _validate_configuration(
+        self,
+    ) -> None:
+        """Validate backup-specific configuration assumptions."""
+
+        backup_dir = str(
+            self.config.paths[
+                "backup_dir"
+            ]
+        ).strip()
+
+        if not backup_dir:
+            raise BackupError(
+                "Backup directory is not configured."
+            )
+
+        production = (
+            self.config.servers[
+                "production"
+            ]
         )
 
-        backup_dir = Path(
-            self.config.paths["backup_dir"]
-        ).expanduser()
+        if not str(
+            production["hostname"]
+        ).strip():
+            raise BackupError(
+                "Production hostname is not configured."
+            )
+
+        if not str(
+            self.config.environment[
+                "version"
+            ]
+        ).strip():
+            raise BackupError(
+                "Tableau version is not configured."
+            )
+
+        minimum_size = float(
+            self.config.backup[
+                "minimum_backup_size_mb"
+            ]
+        )
+
+        if minimum_size <= 0:
+            raise BackupError(
+                "minimum_backup_size_mb must be greater than zero."
+            )
+
+        minimum_free = float(
+            self.config.backup[
+                "minimum_free_space_gb"
+            ]
+        )
+
+        if minimum_free <= 0:
+            raise BackupError(
+                "minimum_free_space_gb must be greater than zero."
+            )
+
+    # ------------------------------------------------------------------
+    # Stage 0 - Preflight
+    # ------------------------------------------------------------------
+
+    def _run_preflight(
+        self,
+    ) -> None:
+        """Validate disk capacity and Tableau Server availability."""
+
+        required_free_gb = float(
+            self.config.backup[
+                "minimum_free_space_gb"
+            ]
+        )
 
         validate_disk_space(
-            backup_dir,
-            required_gb=minimum_free_space_gb,
+            self.config.paths[
+                "backup_dir"
+            ],
+            required_gb=required_free_gb,
         )
 
-        logger.info(
-            "Preflight disk-space validation passed."
+        status_result = (
+            self.tsm.status()
         )
-
-        status_result = self.tsm.status()
 
         if not status_result.success:
             raise ValidationError(
-                "TSM status validation failed before backup."
+                "Unable to verify Tableau Server "
+                "status before backup."
             )
 
-        logger.info(
-            "Preflight TSM status validation passed."
-        )
+    # ------------------------------------------------------------------
+    # Stage 1 - Work directory
+    # ------------------------------------------------------------------
 
-    def _resolve_backup_output(
+    def _prepare_work_directory(
         self,
-        expected_path: Path,
-        output_stem: Path,
     ) -> None:
-        """
-        Resolve the TSM-generated .tsbak file.
+        """Create an isolated run-specific staging directory."""
 
-        Tableau/TSM may append the .tsbak extension when the output path
-        is supplied without it. The search is restricted to the isolated
-        run directory and never follows arbitrary filesystem locations.
-        """
-
-        if expected_path.exists():
-            return
-
-        if not output_stem.exists():
-            candidates = sorted(
-                self.run_work_dir.glob(
-                    f"{output_stem.name}*.tsbak"
-                )
-            )
-
-            if len(candidates) == 1:
-                candidate = candidates[0]
-
-                candidate.replace(expected_path)
-                return
-
-        if expected_path.exists():
-            return
-
-        raise ValidationError(
-            "TSM reported successful backup creation, but the expected "
-            ".tsbak artifact was not found in the isolated staging directory."
+        self.backup_root.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-    @staticmethod
+        if self.run_work_dir.exists():
+            raise BackupError(
+                "Backup staging directory already exists."
+            )
+
+        self.run_work_dir.mkdir(
+            parents=True,
+            exist_ok=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Stage 2 - Settings export
+    # ------------------------------------------------------------------
+
+    def _export_settings(
+        self,
+    ) -> Path:
+        """Export Tableau Server settings into the isolated workspace."""
+
+        settings_path = (
+            self.run_work_dir
+            / "settings.json"
+        )
+
+        if settings_path.exists():
+            raise BackupError(
+                "Settings target already exists."
+            )
+
+        result = self.tsm.export_settings(
+            str(settings_path)
+        )
+
+        if not result.success:
+            raise BackupError(
+                "Tableau settings export failed."
+            )
+
+        try:
+            validate_file(
+                settings_path,
+                must_exist=True,
+            )
+        except Exception as exc:
+            raise BackupError(
+                "Exported Tableau settings failed validation."
+            ) from exc
+
+        if settings_path.stat().st_size <= 0:
+            raise BackupError(
+                "Exported Tableau settings file is empty."
+            )
+
+        return settings_path
+
+    # ------------------------------------------------------------------
+    # Stage 3 - Repository backup
+    # ------------------------------------------------------------------
+
+    def _create_repository_backup(
+        self,
+    ) -> Path:
+        """Create the Tableau repository/File Store backup."""
+
+        target_path = (
+            self.run_work_dir
+            / "backup.tsbak"
+        )
+
+        # Tableau's TSM backup command is passed a base path.
+        # With append_date=False, the resulting artifact is expected
+        # to be backup.tsbak.
+        command_path = (
+            self.run_work_dir
+            / "backup"
+        )
+
+        if target_path.exists():
+            raise BackupError(
+                "Backup target already exists."
+            )
+
+        result = self.tsm.create_backup(
+            str(command_path),
+            append_date=False,
+        )
+
+        if not result.success:
+            raise BackupError(
+                "Tableau repository backup failed."
+            )
+
+        minimum_backup_mb = float(
+            self.config.backup[
+                "minimum_backup_size_mb"
+            ]
+        )
+
+        try:
+            validate_file(
+                target_path,
+                must_exist=True,
+                min_size_mb=minimum_backup_mb,
+            )
+        except Exception as exc:
+            raise BackupError(
+                "Created Tableau backup failed local validation."
+            ) from exc
+
+        if (
+            target_path.stat().st_size
+            > self.MAX_ARTIFACT_SIZE_BYTES
+        ):
+            raise BackupError(
+                "Created Tableau backup exceeds maximum "
+                "allowed artifact size."
+            )
+
+        return target_path
+
+    # ------------------------------------------------------------------
+    # Artifact metadata
+    # ------------------------------------------------------------------
+
     def _build_artifact_metadata(
+        self,
+        *,
         logical_name: str,
         local_path: Path,
-        blob_path: str,
-        sha256: str,
-        size_bytes: int,
-    ) -> dict:
-        """Build a normalized artifact metadata record."""
+    ) -> Dict[str, Any]:
+        """Validate an artifact and build trusted manifest metadata."""
 
-        if not logical_name.strip():
-            raise ValueError(
-                "logical_name cannot be empty."
+        if logical_name not in (
+            self.SAFE_ARTIFACT_NAMES
+        ):
+            raise BackupError(
+                "Unsupported backup artifact name."
             )
+
+        local_path = local_path.resolve()
+
+        try:
+            local_path.relative_to(
+                self.run_work_dir.resolve()
+            )
+        except ValueError as exc:
+            raise BackupError(
+                "Backup artifact escapes isolated workspace."
+            ) from exc
+
+        if local_path.name != logical_name:
+            raise BackupError(
+                f"Unexpected artifact filename for {logical_name}."
+            )
+
+        if not local_path.is_file():
+            raise BackupError(
+                f"Backup artifact is not a regular file: "
+                f"{logical_name}"
+            )
+
+        try:
+            size_bytes = (
+                local_path.stat().st_size
+            )
+        except OSError as exc:
+            raise BackupError(
+                f"Unable to determine artifact size: "
+                f"{logical_name}"
+            ) from exc
 
         if size_bytes <= 0:
-            raise IntegrityError(
-                f"Artifact '{logical_name}' is empty."
+            raise BackupError(
+                f"Artifact is empty: {logical_name}"
             )
 
-        return {
-            "logical_name": logical_name,
-            "filename": local_path.name,
-            "local_path": str(local_path),
-            "size_bytes": size_bytes,
-            "sha256": sha256,
-            "blob_path": blob_path,
-        }
+        if (
+            size_bytes
+            > self.MAX_ARTIFACT_SIZE_BYTES
+        ):
+            raise BackupError(
+                f"Artifact exceeds maximum size: "
+                f"{logical_name}"
+            )
 
-    def _build_manifest(
-        self,
-        artifacts: Dict[str, dict],
-        remote_blob_prefix: str,
-    ) -> dict:
-        """Create an immutable inventory manifest for the backup run."""
+        try:
+            checksum = sha256_file(
+                local_path
+            )
+        except Exception as exc:
+            raise BackupError(
+                f"Unable to calculate SHA-256 for "
+                f"{logical_name}"
+            ) from exc
 
-        completed_at = datetime.datetime.now(
-            datetime.timezone.utc
+        checksum = self._validate_sha256(
+            checksum
         )
 
-        production = self.config.servers["production"]
+        blob_path = (
+            f"{self.remote_blob_prefix}/"
+            f"{logical_name}"
+        )
 
         return {
-            "manifest_version": MANIFEST_VERSION,
+            "filename": logical_name,
+            "size_bytes": size_bytes,
+            "sha256": checksum,
+            "blob_path": blob_path,
+            "local_path": str(local_path),
+        }
+
+    # ------------------------------------------------------------------
+    # Stage 4 - Manifest
+    # ------------------------------------------------------------------
+
+    def _create_manifest(
+        self,
+        *,
+        artifacts: Dict[str, Dict[str, Any]],
+        backup_created_at: dt.datetime,
+        pipeline_start: float,
+    ) -> Path:
+        """Create the immutable backup manifest."""
+
+        if not artifacts:
+            raise BackupError(
+                "Cannot create a manifest without artifacts."
+            )
+
+        completed_at = (
+            dt.datetime.now(
+                dt.timezone.utc
+            )
+        )
+
+        manifest = {
+            "manifest_version": self.MANIFEST_VERSION,
             "run_id": self.run_id,
-            "status": MANIFEST_STATUS,
+            "status": self.MANIFEST_STATUS,
             "source": {
-                "environment": self.config.environment.get(
-                    "name",
-                    "production",
+                "environment": "production",
+                "hostname": (
+                    self.config.servers[
+                        "production"
+                    ]["hostname"]
                 ),
-                "hostname": production["hostname"],
-                "tableau_version": self.config.environment[
-                    "version"
-                ],
-                "identity_store": production[
-                    "identity_store"
-                ],
+                "version": (
+                    self.config.environment[
+                        "version"
+                    ]
+                ),
+                "identity_store": (
+                    self.config.servers[
+                        "production"
+                    ]["identity_store"]
+                ),
             },
             "timing": {
                 "started_at_utc": (
-                    self.started_at_dt.isoformat()
+                    self.started_at.isoformat()
+                ),
+                "backup_created_at_utc": (
+                    backup_created_at.isoformat()
                 ),
                 "completed_at_utc": (
                     completed_at.isoformat()
                 ),
+                "duration_seconds": round(
+                    time.monotonic()
+                    - pipeline_start,
+                    3,
+                ),
             },
             "artifacts": {
-                key: {
-                    "logical_name": value["logical_name"],
-                    "filename": value["filename"],
-                    "size_bytes": value["size_bytes"],
-                    "sha256": value["sha256"],
-                    "blob_path": value["blob_path"],
-                }
-                for key, value in artifacts.items()
+                "backup.tsbak": (
+                    self._manifest_artifact(
+                        artifacts[
+                            "backup.tsbak"
+                        ]
+                    )
+                ),
+                "settings.json": (
+                    self._manifest_artifact(
+                        artifacts[
+                            "settings.json"
+                        ]
+                    )
+                ),
             },
             "remote_storage": {
-                "account": self.config.azure[
-                    "storage_account_name"
-                ],
-                "container": self.config.azure[
-                    "storage_container"
-                ],
-                "prefix": remote_blob_prefix,
+                "account": (
+                    self.config.azure[
+                        "storage_account_name"
+                    ]
+                ),
+                "container": (
+                    self.config.azure[
+                        "storage_container"
+                    ]
+                ),
+                "prefix": (
+                    self.remote_blob_prefix
+                ),
             },
         }
 
-    @staticmethod
-    def _write_json(
-        path: Path,
-        data: Dict[str, Any],
-    ) -> None:
-        """Write JSON using deterministic UTF-8 formatting."""
+        manifest_path = (
+            self.run_work_dir
+            / f"manifest_{self.timestamp}.json"
+        )
+
+        if manifest_path.exists():
+            raise BackupError(
+                "Manifest file already exists."
+            )
 
         try:
-            with path.open(
-                "w",
-                encoding="utf-8",
-                newline="\n",
-            ) as file:
-                json.dump(
-                    data,
-                    file,
-                    indent=2,
-                    sort_keys=True,
-                    ensure_ascii=False,
+            serialized = json.dumps(
+                manifest,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+
+            encoded = serialized.encode(
+                "utf-8"
+            )
+
+            if len(encoded) > (
+                self.MAX_MANIFEST_SIZE_BYTES
+            ):
+                raise BackupError(
+                    "Generated manifest exceeds maximum size."
                 )
-                file.write("\n")
+
+            manifest_path.write_bytes(
+                encoded
+            )
 
         except OSError as exc:
-            raise ValidationError(
+            raise BackupError(
                 "Unable to write backup manifest."
             ) from exc
 
-    def _execute_local_cleanup(self) -> str:
-        """
-        Remove the isolated staging directory after remote verification.
+        self._validate_manifest_structure(
+            manifest
+        )
 
-        Cleanup failure is intentionally non-fatal because the backup has
-        already been verified remotely. The result explicitly records the
-        cleanup state for operational visibility.
+        return manifest_path
+
+    @staticmethod
+    def _manifest_artifact(
+        metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Return only metadata that belongs in the remote manifest.
+
+        The local filesystem path intentionally remains outside the
+        persisted manifest.
+        """
+
+        return {
+            "filename": metadata[
+                "filename"
+            ],
+            "size_bytes": metadata[
+                "size_bytes"
+            ],
+            "sha256": metadata[
+                "sha256"
+            ],
+            "blob_path": metadata[
+                "blob_path"
+            ],
+        }
+
+    def _validate_manifest_structure(
+        self,
+        manifest: Dict[str, Any],
+    ) -> None:
+        """Perform final local validation of generated manifest data."""
+
+        if manifest.get(
+            "manifest_version"
+        ) != self.MANIFEST_VERSION:
+            raise BackupError(
+                "Generated manifest version is invalid."
+            )
+
+        if manifest.get(
+            "status"
+        ) != self.MANIFEST_STATUS:
+            raise BackupError(
+                "Generated manifest status is invalid."
+            )
+
+        run_id = manifest.get(
+            "run_id"
+        )
+
+        if not isinstance(
+            run_id,
+            str,
+        ) or not self.RUN_ID_PATTERN.fullmatch(
+            run_id
+        ):
+            raise BackupError(
+                "Generated manifest run_id is invalid."
+            )
+
+        source = manifest.get(
+            "source"
+        )
+
+        if not isinstance(
+            source,
+            dict,
+        ):
+            raise BackupError(
+                "Generated manifest source section is invalid."
+            )
+
+        required_source_fields = {
+            "environment",
+            "hostname",
+            "version",
+            "identity_store",
+        }
+
+        if not required_source_fields.issubset(
+            source
+        ):
+            raise BackupError(
+                "Generated manifest source section is incomplete."
+            )
+
+        artifacts = manifest.get(
+            "artifacts"
+        )
+
+        if not isinstance(
+            artifacts,
+            dict,
+        ):
+            raise BackupError(
+                "Generated manifest artifacts section is invalid."
+            )
+
+        if set(artifacts) != (
+            self.SAFE_ARTIFACT_NAMES
+        ):
+            raise BackupError(
+                "Generated manifest contains an unexpected artifact set."
+            )
+
+        for logical_name, metadata in artifacts.items():
+            if not isinstance(
+                metadata,
+                dict,
+            ):
+                raise BackupError(
+                    f"Invalid generated metadata: {logical_name}"
+                )
+
+            if metadata.get(
+                "filename"
+            ) != logical_name:
+                raise BackupError(
+                    f"Generated artifact filename mismatch: "
+                    f"{logical_name}"
+                )
+
+            self._validate_sha256(
+                metadata.get(
+                    "sha256"
+                )
+            )
+
+            size_bytes = metadata.get(
+                "size_bytes"
+            )
+
+            if (
+                isinstance(
+                    size_bytes,
+                    bool,
+                )
+                or not isinstance(
+                    size_bytes,
+                    int,
+                )
+                or size_bytes <= 0
+                or size_bytes > (
+                    self.MAX_ARTIFACT_SIZE_BYTES
+                )
+            ):
+                raise BackupError(
+                    f"Invalid generated artifact size: "
+                    f"{logical_name}"
+                )
+
+            blob_path = metadata.get(
+                "blob_path"
+            )
+
+            if not isinstance(
+                blob_path,
+                str,
+            ):
+                raise BackupError(
+                    f"Invalid generated blob path: "
+                    f"{logical_name}"
+                )
+
+            expected_path = (
+                f"{self.remote_blob_prefix}/"
+                f"{logical_name}"
+            )
+
+            if blob_path != expected_path:
+                raise BackupError(
+                    f"Generated blob path mismatch: "
+                    f"{logical_name}"
+                )
+
+    def _validate_and_hash_manifest(
+        self,
+        manifest_path: Path,
+    ) -> str:
+        """Validate manifest file size and calculate SHA-256."""
+
+        try:
+            validate_file(
+                manifest_path,
+                must_exist=True,
+            )
+        except Exception as exc:
+            raise BackupError(
+                "Generated manifest failed file validation."
+            ) from exc
+
+        try:
+            size_bytes = (
+                manifest_path.stat().st_size
+            )
+        except OSError as exc:
+            raise BackupError(
+                "Unable to determine manifest size."
+            ) from exc
+
+        if size_bytes > (
+            self.MAX_MANIFEST_SIZE_BYTES
+        ):
+            raise BackupError(
+                "Manifest exceeds maximum size."
+            )
+
+        try:
+            checksum = sha256_file(
+                manifest_path
+            )
+        except Exception as exc:
+            raise BackupError(
+                "Unable to calculate manifest SHA-256."
+            ) from exc
+
+        return self._validate_sha256(
+            checksum
+        )
+
+    # ------------------------------------------------------------------
+    # Stage 5 - Azure upload
+    # ------------------------------------------------------------------
+
+    def _upload_artifacts(
+        self,
+        artifacts: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Upload all backup artifacts to Azure Blob Storage."""
+
+        for logical_name in (
+            "backup.tsbak",
+            "settings.json",
+        ):
+            metadata = artifacts.get(
+                logical_name
+            )
+
+            if not isinstance(
+                metadata,
+                dict,
+            ):
+                raise BackupError(
+                    f"Missing artifact metadata: "
+                    f"{logical_name}"
+                )
+
+            self.azure.upload_file(
+                local_path=metadata[
+                    "local_path"
+                ],
+                blob_path=metadata[
+                    "blob_path"
+                ],
+                sha256_checksum=metadata[
+                    "sha256"
+                ],
+            )
+
+    # ------------------------------------------------------------------
+    # Stage 6 - Remote verification
+    # ------------------------------------------------------------------
+
+    def _verify_remote_artifacts(
+        self,
+        artifacts: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Verify remote size and SHA-256 metadata/content."""
+
+        verify_stream = (
+            self._remote_content_verification_enabled()
+        )
+
+        for logical_name in (
+            "backup.tsbak",
+            "settings.json",
+        ):
+            metadata = artifacts.get(
+                logical_name
+            )
+
+            if not isinstance(
+                metadata,
+                dict,
+            ):
+                raise BackupError(
+                    f"Missing artifact metadata: "
+                    f"{logical_name}"
+                )
+
+            verified = (
+                self.azure.verify_remote_blob(
+                    blob_path=metadata[
+                        "blob_path"
+                    ],
+                    expected_size_bytes=metadata[
+                        "size_bytes"
+                    ],
+                    expected_sha256=metadata[
+                        "sha256"
+                    ],
+                    verify_content_stream=verify_stream,
+                )
+            )
+
+            if not verified:
+                raise BackupError(
+                    f"Remote verification failed: "
+                    f"{logical_name}"
+                )
+
+    # ------------------------------------------------------------------
+    # Configuration helpers
+    # ------------------------------------------------------------------
+
+    def _remote_content_verification_enabled(
+        self,
+    ) -> bool:
+        """Return the configured remote content verification setting."""
+
+        return bool(
+            self.config.backup[
+                "verify_remote_content_sha256"
+            ]
+        )
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def _execute_local_cleanup(
+        self,
+    ) -> str:
+        """
+        Remove local staging only after successful remote verification.
+
+        Cleanup failure does not invalidate the already verified remote
+        backup. The caller receives an explicit FAILED cleanup status.
         """
 
         if not self.run_work_dir.exists():
-            return "ALREADY_CLEAN"
-
-        logger.info(
-            "Starting local staging cleanup."
-        )
+            return "SUCCESS"
 
         try:
             shutil.rmtree(
                 self.run_work_dir
             )
 
-            logger.info(
-                "Local staging cleanup completed successfully."
+            self.logger.info(
+                "Local backup staging cleanup completed."
             )
 
             return "SUCCESS"
 
-        except OSError as exc:
-            logger.warning(
-                "Local staging cleanup failed. "
-                "Remote backup remains verified. error=%s",
-                self._sanitize_error(exc),
+        except OSError:
+            self.logger.warning(
+                "Local backup staging cleanup failed; "
+                "remote backup remains verified."
             )
 
             return "FAILED"
 
+    def _preserve_failed_workspace(
+        self,
+    ) -> None:
+        """Preserve failed backup staging data for investigation."""
+
+        if not self.run_work_dir.exists():
+            return
+
+        try:
+            marker = (
+                self.run_work_dir
+                / "BACKUP_FAILED"
+            )
+
+            marker.write_text(
+                (
+                    "Backup pipeline failed.\n"
+                    "Local staging intentionally preserved "
+                    "for incident investigation.\n"
+                ),
+                encoding="utf-8",
+            )
+
+        except OSError:
+            self.logger.warning(
+                "Unable to create backup failure marker."
+            )
+
+    # ------------------------------------------------------------------
+    # Security helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _validate_sha256(
+        cls,
+        value: Any,
+    ) -> str:
+        """Validate a SHA-256 hexadecimal digest."""
+
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise BackupError(
+                "SHA-256 value must be a string."
+            )
+
+        normalized = value.strip().lower()
+
+        if not cls.SHA256_PATTERN.fullmatch(
+            normalized
+        ):
+            raise BackupError(
+                "Invalid SHA-256 value."
+            )
+
+        return normalized
+
     @staticmethod
-    def _public_artifact_metadata(
-        artifacts: Dict[str, dict],
-    ) -> Dict[str, dict]:
-        """Remove local filesystem paths from externally returned metadata."""
+    def _constant_time_equal(
+        left: str,
+        right: str,
+    ) -> bool:
+        """Compare two hexadecimal digests in constant time."""
 
-        return {
-            key: {
-                "logical_name": value["logical_name"],
-                "filename": value["filename"],
-                "size_bytes": value["size_bytes"],
-                "sha256": value["sha256"],
-                "blob_path": value["blob_path"],
-            }
-            for key, value in artifacts.items()
-        }
+        try:
+            left_bytes = bytes.fromhex(
+                left
+            )
 
-    @staticmethod
-    def _sanitize_error(error: object) -> str:
-        """Return a minimal safe error representation."""
+            right_bytes = bytes.fromhex(
+                right
+            )
 
-        text = str(error)
+        except ValueError:
+            return False
 
-        sensitive_words = (
-            "password",
-            "secret",
-            "token",
-            "passphrase",
-            "client_secret",
-            "access_token",
-            "sas",
+        return hmac.compare_digest(
+            left_bytes,
+            right_bytes,
         )
 
-        if any(
-            word in text.lower()
-            for word in sensitive_words
-        ):
-            return "[REDACTED_ERROR]"
+    # ------------------------------------------------------------------
+    # Result sanitization
+    # ------------------------------------------------------------------
 
-        return text[:1000]
+    @staticmethod
+    def _public_artifact_metadata(
+        artifacts: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Return artifact metadata without exposing local filesystem paths.
+        """
+
+        public: Dict[
+            str,
+            Dict[str, Any],
+        ] = {}
+
+        for logical_name, metadata in artifacts.items():
+            public[logical_name] = {
+                "filename": metadata[
+                    "filename"
+                ],
+                "size_bytes": metadata[
+                    "size_bytes"
+                ],
+                "sha256": metadata[
+                    "sha256"
+                ],
+                "blob_path": metadata[
+                    "blob_path"
+                ],
+            }
+
+        return public
