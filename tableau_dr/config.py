@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict
+
 import yaml
 
 from tableau_dr.exceptions import ConfigurationError
@@ -30,7 +31,11 @@ class Config:
         ("backup", "verify_remote_content_sha256"): bool,
     }
 
-    ALLOWED_IDENTITY_STORES = {"activedirectory", "local", "ldap"}
+    ALLOWED_IDENTITY_STORES = {
+        "activedirectory",
+        "local",
+        "ldap",
+    }
 
     def __init__(self, config_path: str | Path = "config/config.yaml"):
         self.config_path = Path(config_path)
@@ -38,36 +43,151 @@ class Config:
         self.validate_schema()
 
     def _load_yaml(self) -> Dict[str, Any]:
+        """Load YAML configuration safely."""
         if not self.config_path.exists():
-            raise ConfigurationError(f"Configuration file not found: {self.config_path}")
+            raise ConfigurationError(
+                f"Configuration file not found: {self.config_path}"
+            )
+
+        if not self.config_path.is_file():
+            raise ConfigurationError(
+                f"Configuration path is not a file: {self.config_path}"
+            )
+
         try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
-        except Exception as e:
-            raise ConfigurationError(f"Failed to parse YAML configuration: {e}") from e
+            with self.config_path.open("r", encoding="utf-8") as file:
+                data = yaml.safe_load(file)
+        except yaml.YAMLError as exc:
+            raise ConfigurationError(
+                f"Failed to parse YAML configuration: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise ConfigurationError(
+                f"Unable to read configuration file: {self.config_path}"
+            ) from exc
+
+        if data is None:
+            return {}
+
+        if not isinstance(data, dict):
+            raise ConfigurationError(
+                "Configuration root must be a YAML mapping/object."
+            )
+
+        return data
 
     def validate_schema(self) -> None:
-        """Validates nested dictionary structure and type constraints."""
-        for path_keys, expected_type in self.REQUIRED_SCHEMA.items():
-            curr = self._raw_data
-            for key in path_keys:
-                if not isinstance(curr, dict) or key not in curr:
-                    raise ConfigurationError(
-                        f"Missing required configuration key: {' -> '.join(path_keys)}"
-                    )
-                curr = curr[key]
+        """Validate required keys, types, values, and cross-field constraints."""
 
-            if not isinstance(curr, expected_type) or (isinstance(curr, str) and not curr.strip()):
+        for path_keys, expected_type in self.REQUIRED_SCHEMA.items():
+            current: Any = self._raw_data
+
+            for key in path_keys:
+                if not isinstance(current, dict) or key not in current:
+                    raise ConfigurationError(
+                        "Missing required configuration key: "
+                        f"{' -> '.join(path_keys)}"
+                    )
+
+                current = current[key]
+
+            if not isinstance(current, expected_type):
                 raise ConfigurationError(
-                    f"Invalid datatype or empty value for key: {' -> '.join(path_keys)}"
+                    "Invalid datatype for key: "
+                    f"{' -> '.join(path_keys)}"
                 )
 
-        prod_store = self.servers["production"]["identity_store"].lower()
-        dr_store = self.servers["disaster_recovery"]["identity_store"].lower()
+            if isinstance(current, str) and not current.strip():
+                raise ConfigurationError(
+                    "Empty value for key: "
+                    f"{' -> '.join(path_keys)}"
+                )
+
+            if isinstance(current, bool):
+                continue
+
+            if isinstance(current, (int, float)):
+                if current < 0:
+                    raise ConfigurationError(
+                        "Numeric value cannot be negative for key: "
+                        f"{' -> '.join(path_keys)}"
+                    )
+
+        self._validate_azure()
+        self._validate_servers()
+        self._validate_paths()
+        self._validate_backup()
+
+    def _validate_azure(self) -> None:
+        """Validate Azure retry configuration."""
+
+        max_retries = self.azure["max_retries"]
+        retry_backoff_factor = self.azure["retry_backoff_factor"]
+
+        if max_retries < 0:
+            raise ConfigurationError(
+                "azure -> max_retries must be >= 0"
+            )
+
+        if retry_backoff_factor < 0:
+            raise ConfigurationError(
+                "azure -> retry_backoff_factor must be >= 0"
+            )
+
+    def _validate_servers(self) -> None:
+        """Validate production and DR server configuration."""
+
+        production = self.servers["production"]
+        disaster_recovery = self.servers["disaster_recovery"]
+
+        prod_hostname = production["hostname"].strip().lower()
+        dr_hostname = disaster_recovery["hostname"].strip().lower()
+
+        if prod_hostname == dr_hostname:
+            raise ConfigurationError(
+                "Production and disaster recovery hostnames "
+                "must be different."
+            )
+
+        prod_store = production["identity_store"].strip().lower()
+        dr_store = disaster_recovery["identity_store"].strip().lower()
+
         if prod_store not in self.ALLOWED_IDENTITY_STORES:
-            raise ConfigurationError(f"Unsupported production identity store: {prod_store}")
+            raise ConfigurationError(
+                f"Unsupported production identity store: {prod_store}"
+            )
+
         if dr_store not in self.ALLOWED_IDENTITY_STORES:
-            raise ConfigurationError(f"Unsupported DR identity store: {dr_store}")
+            raise ConfigurationError(
+                f"Unsupported DR identity store: {dr_store}"
+            )
+
+    def _validate_paths(self) -> None:
+        """Validate required filesystem paths."""
+
+        for name in ("backup_dir", "recovery_work_dir"):
+            value = self.paths[name]
+
+            if not value.strip():
+                raise ConfigurationError(
+                    f"paths -> {name} cannot be empty"
+                )
+
+    def _validate_backup(self) -> None:
+        """Validate backup safety thresholds."""
+
+        minimum_free_space = self.backup["minimum_free_space_gb"]
+        minimum_backup_size = self.backup["minimum_backup_size_mb"]
+
+        if minimum_free_space <= 0:
+            raise ConfigurationError(
+                "backup -> minimum_free_space_gb must be greater than 0"
+            )
+
+        if minimum_backup_size <= 0:
+            raise ConfigurationError(
+                "backup -> minimum_backup_size_mb must be greater than 0"
+            )
 
     @property
     def environment(self) -> Dict[str, Any]:
