@@ -20,6 +20,21 @@ DEFAULT_CONFIG_PATH = "config/config.yaml"
 CONFIRMATION_TEXT = "CONFIRM-FAILOVER"
 EMERGENCY_AUTH_ENV = "TABLEAU_DR_EMERGENCY_AUTH_CODE"
 
+MAX_CONFIG_PATH_LENGTH = 4096
+MAX_MANIFEST_BLOB_LENGTH = 1024
+MAX_OPERATOR_REASON_LENGTH = 1000
+CONTROL_CHARACTER_TRANSLATION = str.maketrans(
+    "",
+    "",
+    "".join(
+        chr(code)
+        for code in list(range(0, 9))
+        + list(range(11, 13))
+        + list(range(14, 32))
+        + [127]
+    ),
+)
+
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
@@ -38,7 +53,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--manifest-blob",
-        help="Explicit Azure Blob path to the target manifest.json.",
+        help=(
+            "Explicit Azure Blob path to the target recovery manifest. "
+            "If omitted, the recovery manager resolves the latest valid manifest."
+        ),
     )
 
     parser.add_argument(
@@ -62,15 +80,90 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _contains_control_characters(value: str) -> bool:
+    """Return True when a string contains unsafe control characters."""
+    return value.translate(CONTROL_CHARACTER_TRANSLATION) != value
+
+
+def _validate_config_path(config_path: str) -> Path:
+    """Validate and normalize the configuration file path."""
+    if not isinstance(config_path, str):
+        raise ValueError("Configuration path must be a string.")
+
+    normalized = config_path.strip()
+
+    if not normalized:
+        raise ValueError("Configuration path cannot be empty.")
+
+    if len(normalized) > MAX_CONFIG_PATH_LENGTH:
+        raise ValueError("Configuration path exceeds the maximum length.")
+
+    if _contains_control_characters(normalized):
+        raise ValueError(
+            "Configuration path contains unsupported control characters."
+        )
+
+    return Path(normalized).expanduser()
+
+
+def _validate_manifest_blob(
+    manifest_blob: Optional[str],
+) -> Optional[str]:
+    """Validate an explicitly supplied manifest blob reference."""
+    if manifest_blob is None:
+        return None
+
+    normalized = manifest_blob.strip()
+
+    if not normalized:
+        raise ValueError("Manifest blob path cannot be empty.")
+
+    if len(normalized) > MAX_MANIFEST_BLOB_LENGTH:
+        raise ValueError(
+            "Manifest blob path exceeds the maximum allowed length."
+        )
+
+    if _contains_control_characters(normalized):
+        raise ValueError(
+            "Manifest blob path contains unsupported control characters."
+        )
+
+    return normalized
+
+
+def _validate_operator_reason(
+    operator_reason: Optional[str],
+) -> Optional[str]:
+    """Validate and normalize the operator justification."""
+    if operator_reason is None:
+        return None
+
+    normalized = operator_reason.strip()
+
+    if not normalized:
+        raise ValueError("Operator reason cannot be empty.")
+
+    if len(normalized) > MAX_OPERATOR_REASON_LENGTH:
+        raise ValueError(
+            "Operator reason exceeds the maximum allowed length."
+        )
+
+    if _contains_control_characters(normalized):
+        raise ValueError(
+            "Operator reason contains unsupported control characters."
+        )
+
+    return normalized
+
+
 def _get_emergency_auth_code(
     *,
     non_interactive: bool,
 ) -> Optional[str]:
     """
-    Obtain the emergency authorization code without exposing it
-    through command-line arguments.
+    Obtain the emergency authorization code without exposing it through
+    command-line arguments.
     """
-
     environment_code = os.environ.get(EMERGENCY_AUTH_ENV)
 
     if environment_code:
@@ -93,11 +186,12 @@ def _get_emergency_auth_code(
 
 def _confirm_interactive_failover() -> bool:
     """Require explicit operator confirmation before destructive recovery."""
-
     print()
     print("[WARNING] DISASTER RECOVERY FAILOVER")
     print("[WARNING] This operation may overwrite data on the DR server.")
-    print("[WARNING] Production must be safely fenced before recovery continues.")
+    print(
+        "[WARNING] Production must be safely fenced before recovery continues."
+    )
     print()
 
     confirmation = input(
@@ -107,30 +201,8 @@ def _confirm_interactive_failover() -> bool:
     return confirmation == CONFIRMATION_TEXT
 
 
-def _validate_operator_reason(
-    operator_reason: Optional[str],
-) -> Optional[str]:
-    """Validate and normalize the operator justification."""
-
-    if operator_reason is None:
-        return None
-
-    normalized = operator_reason.strip()
-
-    if not normalized:
-        raise ValueError("Operator reason cannot be empty.")
-
-    if len(normalized) > 1000:
-        raise ValueError(
-            "Operator reason exceeds the maximum allowed length."
-        )
-
-    return normalized
-
-
 def main() -> int:
     """Execute the Tableau DR failover workflow."""
-
     args = parse_args()
 
     run_id = uuid.uuid4().hex.upper()
@@ -142,36 +214,30 @@ def main() -> int:
     )
 
     logger.warning(
-        "========================================================================="
+        "======================================================================="
     )
     logger.warning(
-        "                 DISASTER RECOVERY FAILOVER INITIATED"
+        "              DISASTER RECOVERY FAILOVER INITIATED"
     )
     logger.warning(
-        "========================================================================="
+        "======================================================================="
     )
 
     try:
-        operator_reason = _validate_operator_reason(
-            args.operator_reason
-        )
+        config_path = _validate_config_path(args.config)
+        manifest_blob = _validate_manifest_blob(args.manifest_blob)
+        operator_reason = _validate_operator_reason(args.operator_reason)
 
         if not args.non_interactive:
             if not _confirm_interactive_failover():
-                logger.info(
-                    "Failover operation cancelled by operator."
-                )
+                logger.info("Failover operation cancelled by operator.")
                 return 0
 
         emergency_auth_code = _get_emergency_auth_code(
             non_interactive=args.non_interactive,
         )
 
-        config_path = Path(args.config).expanduser()
-
-        logger.warning(
-            "Loading and validating DR configuration."
-        )
+        logger.warning("Loading and validating DR configuration.")
 
         config = Config(config_path=config_path)
 
@@ -180,16 +246,12 @@ def main() -> int:
             run_id=run_id,
         )
 
-        logger.warning(
-            "Starting failover state machine. "
-            "run_id=%s",
-            run_id,
-        )
+        logger.warning("Starting failover state machine.")
 
         result = manager.execute_failover(
             emergency_auth_code=emergency_auth_code,
             operator_reason=operator_reason,
-            target_manifest_blob=args.manifest_blob,
+            target_manifest_blob=manifest_blob,
         )
 
         logger.info(
@@ -222,8 +284,7 @@ def main() -> int:
         )
 
         logger.error(
-            "Tableau DR failover failed. "
-            "state=%s failed_step=%s",
+            "Tableau DR failover failed. state=%s failed_step=%s",
             result.current_state.value,
             failed_step,
         )
